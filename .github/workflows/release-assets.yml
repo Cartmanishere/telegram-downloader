@@ -27,12 +27,8 @@ jobs:
             runner: ubuntu-latest
             label: linux-arm64
             asset_suffix: linux-arm64
-          - target: x86_64-apple-darwin
-            runner: macos-13
-            label: macos-amd64
-            asset_suffix: macos-amd64
           - target: aarch64-apple-darwin
-            runner: macos-latest
+            runner: macos-15
             label: macos-arm64
             asset_suffix: macos-arm64
 
@@ -55,7 +51,7 @@ jobs:
         run: cross build --release --target ${{ matrix.target }}
 
       - name: Build release binary for macOS
-        if: startsWith(matrix.target, 'x86_64-apple') || startsWith(matrix.target, 'aarch64-apple')
+        if: startsWith(matrix.target, 'aarch64-apple')
         run: cargo build --release --target ${{ matrix.target }}
 
       - name: Package artifact
