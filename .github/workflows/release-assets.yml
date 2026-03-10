@@ -1,0 +1,70 @@
+name: Release Assets
+
+on:
+  release:
+    types:
+      - created
+
+permissions:
+  contents: write
+
+env:
+  BINARY_NAME: telegram-downloader-rust
+
+jobs:
+  build-and-upload:
+    name: Build ${{ matrix.label }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            label: linux-amd64
+            asset_suffix: linux-amd64
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-latest
+            label: linux-arm64
+            asset_suffix: linux-arm64
+          - target: x86_64-apple-darwin
+            runner: macos-13
+            label: macos-amd64
+            asset_suffix: macos-amd64
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+            label: macos-arm64
+            asset_suffix: macos-arm64
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cross
+        if: startsWith(matrix.target, 'x86_64-unknown-linux') || startsWith(matrix.target, 'aarch64-unknown-linux')
+        run: cargo install cross --git https://github.com/cross-rs/cross --locked
+
+      - name: Build release binary for Linux
+        if: startsWith(matrix.target, 'x86_64-unknown-linux') || startsWith(matrix.target, 'aarch64-unknown-linux')
+        run: cross build --release --target ${{ matrix.target }}
+
+      - name: Build release binary for macOS
+        if: startsWith(matrix.target, 'x86_64-apple') || startsWith(matrix.target, 'aarch64-apple')
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package artifact
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/${{ env.BINARY_NAME }} dist/${{ env.BINARY_NAME }}
+          tar -C dist -czf ${{ env.BINARY_NAME }}-${{ matrix.asset_suffix }}.tar.gz ${{ env.BINARY_NAME }}
+
+      - name: Upload release asset
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.BINARY_NAME }}-${{ matrix.asset_suffix }}.tar.gz
