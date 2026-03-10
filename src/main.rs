@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Context, Result};
-use dotenvy::from_filename;
+use dotenvy::from_path;
 use grammers_client::client::files::{DownloadIter, MAX_CHUNK_SIZE, MIN_CHUNK_SIZE};
 use grammers_client::types::update::Message as UpdateMessage;
 use grammers_client::types::{Media, Message};
@@ -181,7 +181,10 @@ impl ProgressTracker {
 async fn main() -> Result<()> {
     let script_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let env_path = script_dir.join(".env");
-    let _ = from_filename(&env_path);
+    if env_path.exists() {
+        from_path(&env_path)
+            .with_context(|| format!("failed to load environment from {}", env_path.display()))?;
+    }
     configure_logging();
 
     let config = AppConfig::from_env(&script_dir)?;
