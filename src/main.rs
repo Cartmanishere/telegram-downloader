@@ -179,15 +179,10 @@ impl ProgressTracker {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let script_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let env_path = script_dir.join(".env");
-    if env_path.exists() {
-        from_path(&env_path)
-            .with_context(|| format!("failed to load environment from {}", env_path.display()))?;
-    }
+    let config_base_dir = load_runtime_env()?.unwrap_or(env::current_dir().context("failed to resolve current working directory")?);
     configure_logging();
 
-    let config = AppConfig::from_env(&script_dir)?;
+    let config = AppConfig::from_env(&config_base_dir)?;
     let session = Arc::new(
         SqliteSession::open(&config.session_path)
             .with_context(|| format!("failed to open session {}", config.session_path.display()))?,
@@ -246,6 +241,31 @@ async fn main() -> Result<()> {
             });
         }
     }
+}
+
+fn load_runtime_env() -> Result<Option<PathBuf>> {
+    let current_dir = env::current_dir().context("failed to resolve current working directory")?;
+    let current_env_path = current_dir.join(".env");
+    if current_env_path.exists() {
+        from_path(&current_env_path)
+            .with_context(|| format!("failed to load environment from {}", current_env_path.display()))?;
+        return Ok(Some(current_dir));
+    }
+
+    let exe_dir = env::current_exe()
+        .context("failed to resolve executable path")?
+        .parent()
+        .map(Path::to_path_buf);
+    if let Some(exe_dir) = exe_dir {
+        let exe_env_path = exe_dir.join(".env");
+        if exe_env_path.exists() {
+            from_path(&exe_env_path)
+                .with_context(|| format!("failed to load environment from {}", exe_env_path.display()))?;
+            return Ok(Some(exe_dir));
+        }
+    }
+
+    Ok(None)
 }
 
 impl AppConfig {

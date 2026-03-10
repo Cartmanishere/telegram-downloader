@@ -18,7 +18,8 @@ Rust Telegram media downloader built on `grammers-client`.
 
 ## Configuration
 
-The binary loads environment variables from `.env` in the project root.
+The binary loads environment variables from `.env` in the current working directory.
+If that file is absent, it falls back to `.env` next to the executable.
 
 Required variables:
 
@@ -28,8 +29,8 @@ Required variables:
 
 Optional variables:
 
-- `TELEGRAM_SESSION_NAME`: Session database path. Default: `telegram_downloader.session`
-- `DOWNLOAD_DIR`: Download destination. Default: `./downloads-mtproto`
+- `TELEGRAM_SESSION_NAME`: Session database path. Relative paths are resolved from the loaded `.env` directory, or the current working directory if no `.env` file is loaded. Default: `telegram_downloader.session`
+- `DOWNLOAD_DIR`: Download destination. Relative paths are resolved from the loaded `.env` directory, or the current working directory if no `.env` file is loaded. Default: `./downloads-mtproto`
 - `MAX_CONCURRENT_DOWNLOADS`: Parallel file downloads. Default: `2`
 - `PARALLEL_CHUNK_DOWNLOADS`: Segment workers per file. Default: `4`
 - `DOWNLOAD_CHUNK_SIZE_MB`: Per-request chunk size in MB. Default: `0.5`
@@ -89,4 +90,4 @@ GitHub releases build and attach binaries for:
 ## Notes
 
 - This app signs in as a bot, so it only receives updates Telegram delivers to bots.
-- Relative paths in `.env` are resolved from the project root.
+- Absolute paths in environment variables are used as-is.
