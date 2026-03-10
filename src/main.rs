@@ -14,7 +14,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::fs::{self as tokio_fs, File, OpenOptions};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{Mutex, Semaphore};
@@ -22,6 +22,7 @@ use tokio::sync::{Mutex, Semaphore};
 const PROGRESS_EDIT_INTERVAL_SECONDS: u64 = 10;
 const MIN_PROGRESS_LOG_INCREMENT_MB: f64 = 1.0;
 const TERMINAL_LINE_WIDTH: usize = 140;
+const PROGRESS_BAR_WIDTH: usize = 10;
 
 static TERMINAL_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
@@ -76,13 +77,15 @@ struct ProgressState {
     completed_bytes: u64,
     segment_progress: Vec<u64>,
     last_logged_mb: f64,
-    status_text: String,
+    terminal_status_text: String,
+    telegram_status_text: String,
 }
 
 #[derive(Clone)]
 struct ProgressTracker {
     filename: String,
     total_size: Option<u64>,
+    started_at: Instant,
     inner: Arc<Mutex<ProgressState>>,
 }
 
@@ -91,11 +94,13 @@ impl ProgressTracker {
         Self {
             filename,
             total_size,
+            started_at: Instant::now(),
             inner: Arc::new(Mutex::new(ProgressState {
                 completed_bytes: 0,
                 segment_progress: Vec::new(),
                 last_logged_mb: -1.0,
-                status_text: String::new(),
+                terminal_status_text: String::new(),
+                telegram_status_text: String::new(),
             })),
         }
     }
@@ -103,14 +108,18 @@ impl ProgressTracker {
     async fn set_completed_bytes(&self, completed_bytes: u64) {
         let mut inner = self.inner.lock().await;
         inner.completed_bytes = completed_bytes;
-        inner.status_text = self.format_progress_text(inner.completed_bytes + inner.segment_progress.iter().sum::<u64>());
+        let downloaded = inner.completed_bytes + inner.segment_progress.iter().sum::<u64>();
+        inner.terminal_status_text = self.format_terminal_progress_text(downloaded);
+        inner.telegram_status_text = self.format_telegram_progress_text(downloaded);
     }
 
     async fn log_snapshot(&self) -> Result<()> {
         let text = {
             let mut inner = self.inner.lock().await;
-            inner.status_text = self.format_progress_text(inner.completed_bytes + inner.segment_progress.iter().sum::<u64>());
-            inner.status_text.clone()
+            let downloaded = inner.completed_bytes + inner.segment_progress.iter().sum::<u64>();
+            inner.terminal_status_text = self.format_terminal_progress_text(downloaded);
+            inner.telegram_status_text = self.format_telegram_progress_text(downloaded);
+            inner.terminal_status_text.clone()
         };
         render_terminal_line(&text).await
     }
@@ -124,7 +133,8 @@ impl ProgressTracker {
             inner.segment_progress[segment_index] = bytes_downloaded;
 
             let downloaded = inner.completed_bytes + inner.segment_progress.iter().sum::<u64>();
-            inner.status_text = self.format_progress_text(downloaded);
+            inner.terminal_status_text = self.format_terminal_progress_text(downloaded);
+            inner.telegram_status_text = self.format_telegram_progress_text(downloaded);
             let downloaded_mb = downloaded as f64 / (1024.0 * 1024.0);
             if inner.last_logged_mb >= 0.0
                 && (downloaded_mb - inner.last_logged_mb) < MIN_PROGRESS_LOG_INCREMENT_MB
@@ -132,7 +142,7 @@ impl ProgressTracker {
                 None
             } else {
                 inner.last_logged_mb = downloaded_mb;
-                Some(inner.status_text.clone())
+                Some(inner.terminal_status_text.clone())
             }
         };
 
@@ -150,30 +160,71 @@ impl ProgressTracker {
             }
             inner.segment_progress[segment_index] = segment_size;
             let downloaded = inner.completed_bytes + inner.segment_progress.iter().sum::<u64>();
-            inner.status_text = self.format_progress_text(downloaded);
+            inner.terminal_status_text = self.format_terminal_progress_text(downloaded);
+            inner.telegram_status_text = self.format_telegram_progress_text(downloaded);
             inner.last_logged_mb = downloaded as f64 / (1024.0 * 1024.0);
-            inner.status_text.clone()
+            inner.terminal_status_text.clone()
         };
         render_terminal_line(&text).await
     }
 
     async fn current_status_text(&self) -> String {
         let inner = self.inner.lock().await;
-        inner.status_text.clone()
+        inner.telegram_status_text.clone()
     }
 
-    fn format_progress_text(&self, downloaded: u64) -> String {
+    fn format_terminal_progress_text(&self, downloaded: u64) -> String {
+        let summary = self.format_progress_summary(downloaded);
+        format!("{}: {}", self.filename, summary)
+    }
+
+    fn format_telegram_progress_text(&self, downloaded: u64) -> String {
+        self.format_progress_summary(downloaded)
+    }
+
+    fn format_progress_summary(&self, downloaded: u64) -> String {
         let downloaded_mb = downloaded as f64 / (1024.0 * 1024.0);
+        let elapsed_secs = self.started_at.elapsed().as_secs_f64().max(1.0);
+        let speed_mb_s = downloaded_mb / elapsed_secs;
         if let Some(total_size) = self.total_size.filter(|size| *size > 0) {
             let total_mb = total_size as f64 / (1024.0 * 1024.0);
             let percent = (downloaded as f64 / total_size as f64 * 100.0).min(100.0);
+            let filled = ((downloaded as f64 / total_size as f64) * PROGRESS_BAR_WIDTH as f64)
+                .round() as usize;
+            let filled = filled.min(PROGRESS_BAR_WIDTH);
+            let progress_bar = format!(
+                "{}{}",
+                "█".repeat(filled),
+                "░".repeat(PROGRESS_BAR_WIDTH.saturating_sub(filled))
+            );
+            let eta = if speed_mb_s > 0.0 && downloaded < total_size {
+                let remaining_mb = (total_size - downloaded) as f64 / (1024.0 * 1024.0);
+                format_duration(Duration::from_secs_f64(remaining_mb / speed_mb_s))
+            } else {
+                "0s".to_string()
+            };
             format!(
-                "{}: {:.2}/{:.2} MB ({:.1}%)",
-                self.filename, downloaded_mb, total_mb, percent
+                "[{}] {:.2}/{:.2} MB ({:.1}%) | {:.2} MB/s | ETA {}",
+                progress_bar, downloaded_mb, total_mb, percent, speed_mb_s, eta
             )
         } else {
-            format!("{}: {:.2} MB", self.filename, downloaded_mb)
+            format!("{:.2} MB | {:.2} MB/s", downloaded_mb, speed_mb_s)
         }
+    }
+}
+
+fn format_duration(duration: Duration) -> String {
+    let total_secs = duration.as_secs();
+    let hours = total_secs / 3600;
+    let minutes = (total_secs % 3600) / 60;
+    let seconds = total_secs % 60;
+
+    if hours > 0 {
+        format!("{hours}h {minutes}m")
+    } else if minutes > 0 {
+        format!("{minutes}m {seconds}s")
+    } else {
+        format!("{seconds}s")
     }
 }
 
