@@ -13,12 +13,12 @@ use std::ffi::OsStr;
 use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::process::{Command as StdCommand, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::fs::{self as tokio_fs, File, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio::process::Command;
+use tokio::process::Command as TokioCommand;
 
 /// Identifies a download already in progress so duplicate updates can be ignored.
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
@@ -378,6 +378,26 @@ pub fn move_classified_target(
     target: &ClassificationTarget,
     kind: LibraryKind,
 ) -> Result<PathBuf> {
+    move_classified_target_with_operations(
+        config,
+        target,
+        kind,
+        &|source, destination| fs::rename(source, destination),
+        &|source, destination| move_with_mv(source, destination),
+    )
+}
+
+fn move_classified_target_with_operations<Rename, MoveWithMv>(
+    config: &AppConfig,
+    target: &ClassificationTarget,
+    kind: LibraryKind,
+    rename: &Rename,
+    move_with_mv: &MoveWithMv,
+) -> Result<PathBuf>
+where
+    Rename: Fn(&Path, &Path) -> std::io::Result<()>,
+    MoveWithMv: Fn(&Path, &Path) -> Result<()>,
+{
     let destination_dir = match kind {
         LibraryKind::Movie => &config.movie_dir,
         LibraryKind::TvShow => &config.tv_show_dir,
@@ -390,19 +410,67 @@ pub fn move_classified_target(
         )
     })?;
     let destination_path = choose_available_path(destination_dir, file_name);
-    fs::rename(&target.source_path, &destination_path).with_context(|| {
-        format!(
-            "failed to move {} to {}",
-            target.source_path.display(),
-            destination_path.display()
-        )
-    })?;
+    move_path_with_fallback(&target.source_path, &destination_path, rename, move_with_mv)?;
 
     if let Some(cleanup_dir) = &target.cleanup_dir {
         remove_empty_directory(cleanup_dir)?;
     }
 
     Ok(destination_path)
+}
+
+fn move_path_with_fallback<Rename, MoveWithMv>(
+    source_path: &Path,
+    destination_path: &Path,
+    rename: &Rename,
+    move_with_mv: &MoveWithMv,
+) -> Result<()>
+where
+    Rename: Fn(&Path, &Path) -> std::io::Result<()>,
+    MoveWithMv: Fn(&Path, &Path) -> Result<()>,
+{
+    match rename(source_path, destination_path) {
+        Ok(()) => Ok(()),
+        Err(err) if is_cross_device_link_error(&err) => move_with_mv(source_path, destination_path)
+            .with_context(|| {
+                format!(
+                    "failed to move {} to {}",
+                    source_path.display(),
+                    destination_path.display()
+                )
+            }),
+        Err(err) => Err(err).with_context(|| {
+            format!(
+                "failed to move {} to {}",
+                source_path.display(),
+                destination_path.display()
+            )
+        }),
+    }
+}
+
+fn is_cross_device_link_error(err: &std::io::Error) -> bool {
+    err.raw_os_error() == Some(18)
+}
+
+fn move_with_mv(source_path: &Path, destination_path: &Path) -> Result<()> {
+    let output = StdCommand::new("mv")
+        .arg("--")
+        .arg(source_path)
+        .arg(destination_path)
+        .output()
+        .context("failed to spawn mv")?;
+
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if stderr.is_empty() {
+        bail!("mv exited with status {}", output.status);
+    }
+
+    bail!("mv exited with status {}: {stderr}", output.status);
 }
 
 /// Download a file, resuming partial work and using parallel segments when the total size is known.
@@ -470,7 +538,7 @@ pub async fn download_external_with_aria2(
     tracker: ProgressTracker,
 ) -> Result<()> {
     let (rpc_url, rpc_secret, rpc_port) = allocate_rpc_endpoint(&config).await?;
-    let mut command = Command::new(&config.aria2c_path);
+    let mut command = TokioCommand::new(&config.aria2c_path);
     command
         .arg("--enable-rpc=true")
         .arg("--rpc-listen-all=false")
@@ -989,10 +1057,12 @@ async fn rpc_call<T: for<'de> Deserialize<'de>>(
 
 #[cfg(test)]
 mod tests {
+    use anyhow::bail;
     use super::{
         build_external_target, choose_available_path, contains_payload_file, extract_external_link,
-        move_classified_target, resolve_magnet_payload, ActiveDownloadKey, ClassificationTarget,
-        ExternalSource, LibraryKind,
+        move_classified_target, move_classified_target_with_operations, move_path_with_fallback,
+        resolve_magnet_payload, ActiveDownloadKey, ClassificationTarget, ExternalSource,
+        LibraryKind,
     };
     use crate::config::AppConfig;
     use std::ffi::OsStr;
@@ -1314,6 +1384,63 @@ mod tests {
         assert_eq!(destination, config.anime_dir.join("Anime Series"));
         assert!(destination.exists());
         assert!(!source.exists());
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn move_path_with_fallback_uses_mv_after_cross_device_rename_error() {
+        let base = unique_test_dir("move-fallback-success");
+        let source = base.join("downloads").join("movie.mkv");
+        let destination = base.join("movies").join("movie.mkv");
+        fs::create_dir_all(source.parent().unwrap()).expect("downloads dir should exist");
+        fs::create_dir_all(destination.parent().unwrap()).expect("movie dir should exist");
+        fs::write(&source, b"payload").expect("source should exist");
+
+        move_path_with_fallback(
+            &source,
+            &destination,
+            &|_, _| Err(std::io::Error::from_raw_os_error(18)),
+            &|source, destination| {
+                fs::rename(source, destination)?;
+                Ok(())
+            },
+        )
+        .expect("mv fallback should succeed");
+
+        assert!(destination.exists());
+        assert!(!source.exists());
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn move_classified_target_keeps_cleanup_dir_when_mv_fallback_fails() {
+        let base = unique_test_dir("move-fallback-failure");
+        let config = test_config(&base);
+        fs::create_dir_all(&config.movie_dir).expect("movie dir should exist");
+        fs::create_dir_all(&config.tv_show_dir).expect("tv dir should exist");
+        fs::create_dir_all(&config.anime_dir).expect("anime dir should exist");
+        let container = base.join("downloads").join("torrents").join("abc");
+        fs::create_dir_all(&container).expect("container should exist");
+        let source = container.join("Show");
+        fs::create_dir_all(&source).expect("payload dir should exist");
+
+        let error = move_classified_target_with_operations(
+            &config,
+            &ClassificationTarget {
+                source_path: source.clone(),
+                cleanup_dir: Some(container.clone()),
+            },
+            LibraryKind::Movie,
+            &|_, _| Err(std::io::Error::from_raw_os_error(18)),
+            &|_, _| bail!("mv exited with status 1: permission denied"),
+        )
+        .expect_err("mv fallback should fail");
+
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("failed to move"));
+        assert!(rendered.contains("permission denied"));
+        assert!(source.exists());
+        assert!(container.exists());
         let _ = fs::remove_dir_all(&base);
     }
 
