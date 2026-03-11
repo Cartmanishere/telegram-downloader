@@ -24,16 +24,15 @@ struct ProgressState {
 #[derive(Clone)]
 pub struct ProgressTracker {
     filename: String,
-    total_size: Option<u64>,
     started_at: Instant,
     inner: Arc<Mutex<ProgressState>>,
+    total_size: Arc<Mutex<Option<u64>>>,
 }
 
 impl ProgressTracker {
     pub fn new(filename: String, total_size: Option<u64>) -> Self {
         Self {
             filename,
-            total_size,
             started_at: Instant::now(),
             inner: Arc::new(Mutex::new(ProgressState {
                 completed_bytes: 0,
@@ -42,29 +41,33 @@ impl ProgressTracker {
                 terminal_status_text: String::new(),
                 telegram_status_text: String::new(),
             })),
+            total_size: Arc::new(Mutex::new(total_size)),
         }
     }
 
     pub async fn set_completed_bytes(&self, completed_bytes: u64) {
+        let total_size = self.current_total_size().await;
         let mut inner = self.inner.lock().await;
         inner.completed_bytes = completed_bytes;
         let downloaded = inner.completed_bytes + inner.segment_progress.iter().sum::<u64>();
-        inner.terminal_status_text = self.format_terminal_progress_text(downloaded);
-        inner.telegram_status_text = self.format_telegram_progress_text(downloaded);
+        inner.terminal_status_text = self.format_terminal_progress_text(downloaded, total_size);
+        inner.telegram_status_text = self.format_telegram_progress_text(downloaded, total_size);
     }
 
     pub async fn log_snapshot(&self) -> Result<()> {
+        let total_size = self.current_total_size().await;
         let text = {
             let mut inner = self.inner.lock().await;
             let downloaded = inner.completed_bytes + inner.segment_progress.iter().sum::<u64>();
-            inner.terminal_status_text = self.format_terminal_progress_text(downloaded);
-            inner.telegram_status_text = self.format_telegram_progress_text(downloaded);
+            inner.terminal_status_text = self.format_terminal_progress_text(downloaded, total_size);
+            inner.telegram_status_text = self.format_telegram_progress_text(downloaded, total_size);
             inner.terminal_status_text.clone()
         };
         render_terminal_line(&text).await
     }
 
     pub async fn update(&self, segment_index: usize, bytes_downloaded: u64) -> Result<()> {
+        let total_size = self.current_total_size().await;
         let maybe_text = {
             let mut inner = self.inner.lock().await;
             if inner.segment_progress.len() <= segment_index {
@@ -73,8 +76,8 @@ impl ProgressTracker {
             inner.segment_progress[segment_index] = bytes_downloaded;
 
             let downloaded = inner.completed_bytes + inner.segment_progress.iter().sum::<u64>();
-            inner.terminal_status_text = self.format_terminal_progress_text(downloaded);
-            inner.telegram_status_text = self.format_telegram_progress_text(downloaded);
+            inner.terminal_status_text = self.format_terminal_progress_text(downloaded, total_size);
+            inner.telegram_status_text = self.format_telegram_progress_text(downloaded, total_size);
             let downloaded_mb = downloaded as f64 / (1024.0 * 1024.0);
             if inner.last_logged_mb >= 0.0
                 && (downloaded_mb - inner.last_logged_mb) < MIN_PROGRESS_LOG_INCREMENT_MB
@@ -97,6 +100,7 @@ impl ProgressTracker {
         segment_index: usize,
         segment_size: u64,
     ) -> Result<()> {
+        let total_size = self.current_total_size().await;
         let text = {
             let mut inner = self.inner.lock().await;
             if inner.segment_progress.len() <= segment_index {
@@ -104,8 +108,8 @@ impl ProgressTracker {
             }
             inner.segment_progress[segment_index] = segment_size;
             let downloaded = inner.completed_bytes + inner.segment_progress.iter().sum::<u64>();
-            inner.terminal_status_text = self.format_terminal_progress_text(downloaded);
-            inner.telegram_status_text = self.format_telegram_progress_text(downloaded);
+            inner.terminal_status_text = self.format_terminal_progress_text(downloaded, total_size);
+            inner.telegram_status_text = self.format_telegram_progress_text(downloaded, total_size);
             inner.last_logged_mb = downloaded as f64 / (1024.0 * 1024.0);
             inner.terminal_status_text.clone()
         };
@@ -117,20 +121,48 @@ impl ProgressTracker {
         inner.telegram_status_text.clone()
     }
 
-    fn format_terminal_progress_text(&self, downloaded: u64) -> String {
-        let summary = self.format_progress_summary(downloaded);
+    pub async fn set_absolute_progress(
+        &self,
+        downloaded_bytes: u64,
+        total_size: Option<u64>,
+    ) -> Result<()> {
+        let text = {
+            let mut total = self.total_size.lock().await;
+            *total = total_size;
+            drop(total);
+
+            let mut inner = self.inner.lock().await;
+            inner.completed_bytes = 0;
+            inner.segment_progress.clear();
+            inner.segment_progress.push(downloaded_bytes);
+            inner.last_logged_mb = downloaded_bytes as f64 / (1024.0 * 1024.0);
+            inner.terminal_status_text =
+                self.format_terminal_progress_text(downloaded_bytes, total_size);
+            inner.telegram_status_text =
+                self.format_telegram_progress_text(downloaded_bytes, total_size);
+            inner.terminal_status_text.clone()
+        };
+        render_terminal_line(&text).await
+    }
+
+    async fn current_total_size(&self) -> Option<u64> {
+        *self.total_size.lock().await
+    }
+
+    fn format_terminal_progress_text(&self, downloaded: u64, total_size: Option<u64>) -> String {
+        let summary = self.format_progress_summary(downloaded, total_size);
         format!("{}: {}", self.filename, summary)
     }
 
-    fn format_telegram_progress_text(&self, downloaded: u64) -> String {
-        self.format_progress_summary(downloaded)
+    fn format_telegram_progress_text(&self, downloaded: u64, total_size: Option<u64>) -> String {
+        self.format_progress_summary(downloaded, total_size)
     }
 
-    fn format_progress_summary(&self, downloaded: u64) -> String {
+    fn format_progress_summary(&self, downloaded: u64, total_size: Option<u64>) -> String {
         let downloaded_mb = downloaded as f64 / (1024.0 * 1024.0);
         let elapsed_secs = self.started_at.elapsed().as_secs_f64().max(1.0);
         let speed_mb_s = downloaded_mb / elapsed_secs;
-        if let Some(total_size) = self.total_size.filter(|size| *size > 0) {
+        if let Some(total_size) = total_size.filter(|size| *size > 0) {
             let total_mb = total_size as f64 / (1024.0 * 1024.0);
             let percent = (downloaded as f64 / total_size as f64 * 100.0).min(100.0);
             let filled = ((downloaded as f64 / total_size as f64) * PROGRESS_BAR_WIDTH as f64)
@@ -182,7 +214,36 @@ pub async fn render_terminal_line(text: &str) -> Result<()> {
 
 pub async fn clear_terminal_line() -> Result<()> {
     let _lock = TERMINAL_LOCK.lock().await;
-    print!("\r{space:width$}\r", space = "", width = TERMINAL_LINE_WIDTH);
+    print!(
+        "\r{space:width$}\r",
+        space = "",
+        width = TERMINAL_LINE_WIDTH
+    );
     io::stdout().flush()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ProgressTracker;
+
+    #[tokio::test]
+    async fn absolute_progress_switches_to_known_total() {
+        let tracker = ProgressTracker::new("sample.bin".to_string(), None);
+        tracker
+            .set_absolute_progress(5 * 1024 * 1024, None)
+            .await
+            .expect("absolute progress should render");
+        let initial = tracker.current_status_text().await;
+        assert!(initial.contains("MB |"));
+        assert!(!initial.contains('%'));
+
+        tracker
+            .set_absolute_progress(5 * 1024 * 1024, Some(10 * 1024 * 1024))
+            .await
+            .expect("absolute progress with total should render");
+        let updated = tracker.current_status_text().await;
+        assert!(updated.contains("50.0%"));
+        assert!(updated.contains("ETA"));
+    }
 }

@@ -16,6 +16,8 @@ pub struct AppConfig {
     pub max_concurrent_downloads: usize,
     pub parallel_chunk_downloads: usize,
     pub chunk_size: usize,
+    pub aria2c_path: String,
+    pub aria2c_poll_interval_ms: u64,
     pub reply_on_duplicate: bool,
 }
 
@@ -27,8 +29,7 @@ impl AppConfig {
             .parse::<i32>()
             .context("TELEGRAM_API_ID must be an integer")?;
         let api_hash = env::var("TELEGRAM_API_HASH").context("TELEGRAM_API_HASH is required")?;
-        let bot_token =
-            env::var("TELEGRAM_BOT_TOKEN").context("TELEGRAM_BOT_TOKEN is required")?;
+        let bot_token = env::var("TELEGRAM_BOT_TOKEN").context("TELEGRAM_BOT_TOKEN is required")?;
         let session_path = resolve_config_path(
             base_dir,
             &env::var("TELEGRAM_SESSION_NAME")
@@ -38,9 +39,8 @@ impl AppConfig {
             base_dir,
             &env::var("DOWNLOAD_DIR").unwrap_or_else(|_| "./downloads-mtproto".to_string()),
         );
-        fs::create_dir_all(&download_dir).with_context(|| {
-            format!("failed to create download dir {}", download_dir.display())
-        })?;
+        fs::create_dir_all(&download_dir)
+            .with_context(|| format!("failed to create download dir {}", download_dir.display()))?;
 
         Ok(Self {
             api_id,
@@ -51,6 +51,8 @@ impl AppConfig {
             max_concurrent_downloads: env_usize("MAX_CONCURRENT_DOWNLOADS", 2).max(1),
             parallel_chunk_downloads: env_usize("PARALLEL_CHUNK_DOWNLOADS", 4).max(1),
             chunk_size: chunk_size_from_env(),
+            aria2c_path: env::var("ARIA2C_PATH").unwrap_or_else(|_| "aria2c".to_string()),
+            aria2c_poll_interval_ms: env_u64("ARIA2C_POLL_INTERVAL_MS", 1000).max(100),
             reply_on_duplicate: env_bool("REPLY_ON_DUPLICATE", true),
         })
     }
@@ -123,9 +125,21 @@ fn env_usize(key: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
+fn env_u64(key: &str, default: u64) -> u64 {
+    env::var(key)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(default)
+}
+
 fn env_bool(key: &str, default: bool) -> bool {
     env::var(key)
         .ok()
-        .map(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .map(|value| {
+            matches!(
+                value.to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
         .unwrap_or(default)
 }

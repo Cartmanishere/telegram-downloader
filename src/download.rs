@@ -1,26 +1,57 @@
 use crate::config::AppConfig;
 use crate::progress::ProgressTracker;
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
+use futures_util::future::join_all;
 use grammers_client::client::files::DownloadIter;
 use grammers_client::types::{Media, Message};
-use grammers_client::Client;
+use grammers_client::Client as TelegramClient;
+use regex::Regex;
+use reqwest::{Client as HttpClient, Url};
+use serde::Deserialize;
+use serde_json::json;
 use std::fs;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::fs::{self as tokio_fs, File, OpenOptions};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
+use tokio::process::Command;
 
 /// Identifies a download already in progress so duplicate updates can be ignored.
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
-pub struct ActiveDownloadKey {
-    pub path: PathBuf,
-    pub size: Option<u64>,
+pub enum ActiveDownloadKey {
+    Telegram { path: PathBuf, size: Option<u64> },
+    External { identity: String },
 }
 
 /// Information extracted from a Telegram message before starting a download.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct DownloadCandidate {
     pub filename: String,
     pub file_size: Option<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ExternalSource {
+    DirectUrl { url: String },
+    Magnet { uri: String, info_hash: String },
+}
+
+#[derive(Clone)]
+pub enum DownloadRequest {
+    TelegramMedia {
+        media: Media,
+        candidate: DownloadCandidate,
+        target_path: PathBuf,
+    },
+    ExternalLink {
+        source: ExternalSource,
+        label: String,
+        target_path: PathBuf,
+        expected_size: Option<u64>,
+    },
 }
 
 #[derive(Clone)]
@@ -36,6 +67,106 @@ impl SegmentPlan {
         self.end - self.start
     }
 }
+
+impl DownloadRequest {
+    pub fn active_key(&self) -> ActiveDownloadKey {
+        match self {
+            Self::TelegramMedia {
+                target_path,
+                candidate,
+                ..
+            } => ActiveDownloadKey::Telegram {
+                path: target_path.clone(),
+                size: candidate.file_size,
+            },
+            Self::ExternalLink { source, .. } => ActiveDownloadKey::External {
+                identity: external_identity(source),
+            },
+        }
+    }
+
+    pub fn display_name(&self) -> String {
+        match self {
+            Self::TelegramMedia { candidate, .. } => candidate.filename.clone(),
+            Self::ExternalLink { label, .. } => label.clone(),
+        }
+    }
+
+    pub fn target_path(&self) -> &Path {
+        match self {
+            Self::TelegramMedia { target_path, .. } | Self::ExternalLink { target_path, .. } => {
+                target_path
+            }
+        }
+    }
+
+    pub fn expected_size(&self) -> Option<u64> {
+        match self {
+            Self::TelegramMedia { candidate, .. } => candidate.file_size,
+            Self::ExternalLink { expected_size, .. } => *expected_size,
+        }
+    }
+
+    pub fn already_exists(&self) -> Result<bool> {
+        match self {
+            Self::TelegramMedia {
+                target_path,
+                candidate,
+                ..
+            } => target_matches(target_path, candidate.file_size),
+            Self::ExternalLink {
+                source,
+                target_path,
+                ..
+            } => match source {
+                ExternalSource::DirectUrl { .. } => target_matches(target_path, None),
+                ExternalSource::Magnet { .. } => contains_payload_file(target_path),
+            },
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct AriaRpcResponse<T> {
+    result: T,
+}
+
+#[derive(Deserialize)]
+struct AriaStatus {
+    status: String,
+    #[serde(rename = "completedLength")]
+    completed_length: String,
+    #[serde(rename = "totalLength")]
+    total_length: String,
+}
+
+struct AriaSnapshot {
+    active: Vec<AriaStatus>,
+    waiting: Vec<AriaStatus>,
+    stopped: Vec<AriaStatus>,
+}
+
+impl AriaSnapshot {
+    fn is_terminal(&self) -> bool {
+        self.active.is_empty()
+            && self.waiting.is_empty()
+            && !self.stopped.is_empty()
+            && self
+                .stopped
+                .iter()
+                .all(|status| matches!(status.status.as_str(), "complete" | "error" | "removed"))
+    }
+}
+
+static MAGNET_LINK_RE: once_cell::sync::Lazy<Regex> = once_cell::sync::Lazy::new(|| {
+    Regex::new(r"(?i)magnet:\?[^\s<>]+").expect("magnet regex should compile")
+});
+static DIRECT_LINK_RE: once_cell::sync::Lazy<Regex> = once_cell::sync::Lazy::new(|| {
+    Regex::new(r"(?i)\b(?:https?|ftp)://[^\s<>]+").expect("direct-link regex should compile")
+});
+static BTIH_RE: once_cell::sync::Lazy<Regex> = once_cell::sync::Lazy::new(|| {
+    Regex::new(r"(?i)(?:^|&)xt=urn:btih:([^&]+)").expect("btih regex should compile")
+});
 
 /// Build a human-friendly filename and expected size from Telegram media metadata.
 pub fn build_candidate(message: &Message, media: &Media) -> DownloadCandidate {
@@ -59,6 +190,83 @@ pub fn build_candidate(message: &Message, media: &Media) -> DownloadCandidate {
             filename: format!("download_{}", message.id()),
             file_size: None,
         },
+    }
+}
+
+pub fn classify_download_request(
+    config: &AppConfig,
+    message: &Message,
+) -> Result<Option<DownloadRequest>> {
+    if let Some(media) = message.media() {
+        if matches!(media, Media::Photo(_) | Media::Document(_)) {
+            let candidate = build_candidate(message, &media);
+            let target_path = choose_target_path(
+                &config.download_dir,
+                &candidate.filename,
+                candidate.file_size,
+            )?;
+            return Ok(Some(DownloadRequest::TelegramMedia {
+                media,
+                candidate,
+                target_path,
+            }));
+        }
+    }
+
+    let Some(source) = extract_external_link(message.text()) else {
+        return Ok(None);
+    };
+    let (label, target_path, expected_size) =
+        build_external_target(&config.download_dir, message.id(), &source)?;
+    Ok(Some(DownloadRequest::ExternalLink {
+        source,
+        label,
+        target_path,
+        expected_size,
+    }))
+}
+
+pub fn extract_external_link(text: &str) -> Option<ExternalSource> {
+    if let Some(mat) = MAGNET_LINK_RE.find(text) {
+        let uri = trim_link_punctuation(mat.as_str());
+        let query = uri.split_once('?')?.1;
+        let captures = BTIH_RE.captures(query)?;
+        let info_hash = captures.get(1)?.as_str().to_ascii_lowercase();
+        return Some(ExternalSource::Magnet {
+            uri: uri.to_string(),
+            info_hash,
+        });
+    }
+
+    let direct = DIRECT_LINK_RE.find(text)?;
+    let url = trim_link_punctuation(direct.as_str());
+    let parsed = Url::parse(url).ok()?;
+    match parsed.scheme() {
+        "http" | "https" | "ftp" => Some(ExternalSource::DirectUrl {
+            url: parsed.to_string(),
+        }),
+        _ => None,
+    }
+}
+
+fn build_external_target(
+    download_dir: &Path,
+    message_id: i32,
+    source: &ExternalSource,
+) -> Result<(String, PathBuf, Option<u64>)> {
+    match source {
+        ExternalSource::DirectUrl { url } => {
+            let filename =
+                filename_from_url(url).unwrap_or_else(|| format!("download_{message_id}"));
+            let filename = sanitize_filename(&filename);
+            let target_path = choose_target_path(download_dir, &filename, None)?;
+            Ok((filename, target_path, None))
+        }
+        ExternalSource::Magnet { info_hash, .. } => {
+            let label = format!("torrent_{info_hash}");
+            let target_path = download_dir.join("torrents").join(info_hash);
+            Ok((label, target_path, None))
+        }
     }
 }
 
@@ -108,7 +316,7 @@ pub fn target_matches(path: &Path, expected_size: Option<u64>) -> Result<bool> {
 
 /// Download a file, resuming partial work and using parallel segments when the total size is known.
 pub async fn download_with_resume(
-    client: Client,
+    client: TelegramClient,
     config: AppConfig,
     media: Media,
     target_path: &Path,
@@ -164,8 +372,123 @@ pub async fn download_with_resume(
     Ok(())
 }
 
+pub async fn download_external_with_aria2(
+    config: AppConfig,
+    source: ExternalSource,
+    target_path: &Path,
+    tracker: ProgressTracker,
+) -> Result<()> {
+    let (rpc_url, rpc_secret, rpc_port) = allocate_rpc_endpoint(&config).await?;
+    let mut command = Command::new(&config.aria2c_path);
+    command
+        .arg("--enable-rpc=true")
+        .arg("--rpc-listen-all=false")
+        .arg(format!("--rpc-listen-port={rpc_port}"))
+        .arg(format!("--rpc-secret={rpc_secret}"))
+        .arg("--file-allocation=none")
+        .arg("--summary-interval=0")
+        .arg("--console-log-level=warn")
+        .arg("--seed-time=0")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+
+    match &source {
+        ExternalSource::DirectUrl { url } => {
+            let parent = target_path
+                .parent()
+                .ok_or_else(|| anyhow!("target path has no parent: {}", target_path.display()))?;
+            tokio_fs::create_dir_all(parent).await?;
+            let output_name = target_path
+                .file_name()
+                .ok_or_else(|| anyhow!("target path has no filename: {}", target_path.display()))?
+                .to_string_lossy()
+                .into_owned();
+            command
+                .arg(format!("--dir={}", parent.display()))
+                .arg(format!("--out={output_name}"))
+                .arg("--continue=true")
+                .arg(url);
+        }
+        ExternalSource::Magnet { uri, .. } => {
+            tokio_fs::create_dir_all(target_path).await?;
+            command
+                .arg(format!("--dir={}", target_path.display()))
+                .arg(uri);
+        }
+    }
+
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("failed to spawn {}", config.aria2c_path))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow!("failed to capture aria2c stderr"))?;
+    let stderr_task = tokio::spawn(async move {
+        let mut reader = tokio::io::BufReader::new(stderr);
+        let mut buffer = Vec::new();
+        reader.read_to_end(&mut buffer).await?;
+        Ok::<String, std::io::Error>(String::from_utf8_lossy(&buffer).trim().to_string())
+    });
+
+    let http = HttpClient::builder().build()?;
+    let poll_interval = Duration::from_millis(config.aria2c_poll_interval_ms);
+    let mut shutdown_requested = false;
+
+    let exit_status = loop {
+        tokio::select! {
+            status = child.wait() => break status?,
+            _ = tokio::time::sleep(poll_interval) => {
+                if let Ok(snapshot) = refresh_tracker_from_aria2(&http, &rpc_url, &rpc_secret, &tracker).await {
+                    if snapshot.is_terminal() && !shutdown_requested {
+                        let _ = rpc_call::<String>(
+                            &http,
+                            &rpc_url,
+                            &rpc_secret,
+                            "aria2.forceShutdown",
+                            json!([]),
+                        )
+                        .await;
+                        shutdown_requested = true;
+                    }
+                }
+            }
+        }
+    };
+
+    let _ = refresh_tracker_from_aria2(&http, &rpc_url, &rpc_secret, &tracker).await;
+    let stderr_text = stderr_task.await??;
+    if !exit_status.success() {
+        if stderr_text.is_empty() {
+            bail!("aria2c exited with status {exit_status}");
+        }
+        bail!("aria2c exited with status {exit_status}: {stderr_text}");
+    }
+
+    match source {
+        ExternalSource::DirectUrl { .. } => {
+            if !target_path.is_file() {
+                bail!(
+                    "aria2c completed without creating {}",
+                    target_path.display()
+                );
+            }
+        }
+        ExternalSource::Magnet { .. } => {
+            if !contains_payload_file(target_path)? {
+                bail!(
+                    "aria2c completed without downloaded payload files in {}",
+                    target_path.display()
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
 async fn download_single_stream(
-    client: Client,
+    client: TelegramClient,
     chunk_size: usize,
     media: Media,
     target_path: &Path,
@@ -210,7 +533,7 @@ async fn download_single_stream(
 }
 
 async fn download_segment(
-    client: Client,
+    client: TelegramClient,
     media: Media,
     plan: SegmentPlan,
     chunk_size: usize,
@@ -290,7 +613,7 @@ async fn merge_segments(plans: &[SegmentPlan], target_path: &Path) -> Result<()>
 }
 
 fn build_download_stream<'a>(
-    client: &Client,
+    client: &TelegramClient,
     media: &Media,
     chunk_size: usize,
     offset: u64,
@@ -342,6 +665,29 @@ fn partial_file_path(target_path: &Path) -> PathBuf {
         ))
 }
 
+fn external_identity(source: &ExternalSource) -> String {
+    match source {
+        ExternalSource::DirectUrl { url } => format!("url:{url}"),
+        ExternalSource::Magnet { info_hash, .. } => format!("magnet:{info_hash}"),
+    }
+}
+
+fn filename_from_url(url: &str) -> Option<String> {
+    let parsed = Url::parse(url).ok()?;
+    if parsed.path().ends_with('/') {
+        return None;
+    }
+    let segment = parsed
+        .path_segments()?
+        .filter(|value| !value.is_empty())
+        .next_back()?;
+    Some(segment.to_string())
+}
+
+fn trim_link_punctuation(link: &str) -> &str {
+    link.trim_end_matches(|ch: char| matches!(ch, ')' | ']' | '}' | '.' | ',' | ';' | ':' | '!'))
+}
+
 fn sanitize_filename(name: &str) -> String {
     let mut output = String::with_capacity(name.len());
     for ch in name.chars() {
@@ -374,4 +720,298 @@ fn aligned_existing_size(path: &Path, chunk_size: usize) -> Result<u64> {
         file.set_len(aligned)?;
     }
     Ok(aligned)
+}
+
+fn contains_payload_file(path: &Path) -> Result<bool> {
+    if path.is_file() {
+        return Ok(!is_aria2_artifact(path));
+    }
+    if !path.is_dir() {
+        return Ok(false);
+    }
+
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let entry_path = entry.path();
+        if entry_path.is_dir() && contains_payload_file(&entry_path)? {
+            return Ok(true);
+        }
+        if entry_path.is_file() && !is_aria2_artifact(&entry_path) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn is_aria2_artifact(path: &Path) -> bool {
+    path.file_name()
+        .map(|name| {
+            let name = name.to_string_lossy();
+            name.starts_with('.') || name.ends_with(".aria2")
+        })
+        .unwrap_or(false)
+}
+
+async fn allocate_rpc_endpoint(config: &AppConfig) -> Result<(String, String, u16)> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr: SocketAddr = listener.local_addr()?;
+    let port = addr.port();
+    drop(listener);
+    let secret = format!(
+        "aria2-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    );
+    let rpc_url = format!("http://127.0.0.1:{port}/jsonrpc");
+    if config.aria2c_path.trim().is_empty() {
+        bail!("ARIA2C_PATH cannot be empty");
+    }
+    Ok((rpc_url, secret, port))
+}
+
+async fn refresh_tracker_from_aria2(
+    http: &HttpClient,
+    rpc_url: &str,
+    rpc_secret: &str,
+    tracker: &ProgressTracker,
+) -> Result<AriaSnapshot> {
+    let requests = [
+        rpc_call::<Vec<AriaStatus>>(
+            http,
+            rpc_url,
+            rpc_secret,
+            "aria2.tellActive",
+            json!([["status", "completedLength", "totalLength"]]),
+        ),
+        rpc_call::<Vec<AriaStatus>>(
+            http,
+            rpc_url,
+            rpc_secret,
+            "aria2.tellWaiting",
+            json!([0, 1000, ["status", "completedLength", "totalLength"]]),
+        ),
+        rpc_call::<Vec<AriaStatus>>(
+            http,
+            rpc_url,
+            rpc_secret,
+            "aria2.tellStopped",
+            json!([0, 1000, ["status", "completedLength", "totalLength"]]),
+        ),
+    ];
+
+    let responses = join_all(requests).await;
+    let mut response_groups = Vec::with_capacity(3);
+    let mut downloaded = 0_u64;
+    let mut total = 0_u64;
+    for response in responses {
+        let group = response?;
+        for status in &group {
+            downloaded += status.completed_length.parse::<u64>().unwrap_or(0);
+            total += status.total_length.parse::<u64>().unwrap_or(0);
+        }
+        response_groups.push(group);
+    }
+
+    tracker
+        .set_absolute_progress(downloaded, (total > 0).then_some(total))
+        .await?;
+    let mut groups = response_groups.into_iter();
+    Ok(AriaSnapshot {
+        active: groups.next().unwrap_or_default(),
+        waiting: groups.next().unwrap_or_default(),
+        stopped: groups.next().unwrap_or_default(),
+    })
+}
+
+async fn rpc_call<T: for<'de> Deserialize<'de>>(
+    http: &HttpClient,
+    rpc_url: &str,
+    rpc_secret: &str,
+    method: &str,
+    extra_params: serde_json::Value,
+) -> Result<T> {
+    let mut params = vec![json!(format!("token:{rpc_secret}"))];
+    match extra_params {
+        serde_json::Value::Array(values) => params.extend(values),
+        value => params.push(value),
+    }
+
+    let response = http
+        .post(rpc_url)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": method,
+            "method": method,
+            "params": params,
+        }))
+        .send()
+        .await?
+        .error_for_status()?;
+
+    let payload = response.json::<AriaRpcResponse<T>>().await?;
+    Ok(payload.result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        build_external_target, contains_payload_file, extract_external_link, ActiveDownloadKey,
+        ExternalSource,
+    };
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn extracts_direct_http_link() {
+        let source = extract_external_link("download https://example.com/files/archive.zip")
+            .expect("http link should be found");
+        assert_eq!(
+            source,
+            ExternalSource::DirectUrl {
+                url: "https://example.com/files/archive.zip".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn extracts_https_link_with_query() {
+        let source = extract_external_link("mirror: https://example.com/file.iso?token=abc123")
+            .expect("https link should be found");
+        assert_eq!(
+            source,
+            ExternalSource::DirectUrl {
+                url: "https://example.com/file.iso?token=abc123".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn prefers_magnet_over_direct_link() {
+        let source = extract_external_link(
+            "http://example.com/file.iso magnet:?xt=urn:btih:ABCDEF1234567890&dn=test",
+        )
+        .expect("magnet should be found");
+        assert_eq!(
+            source,
+            ExternalSource::Magnet {
+                uri: "magnet:?xt=urn:btih:ABCDEF1234567890&dn=test".to_string(),
+                info_hash: "abcdef1234567890".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn returns_none_when_no_supported_link_exists() {
+        assert!(extract_external_link("nothing to download here").is_none());
+    }
+
+    #[test]
+    fn builds_direct_target_from_url_filename() {
+        let base = unique_test_dir("direct-target");
+        fs::create_dir_all(&base).expect("test dir should be created");
+        let (label, target, expected_size) = build_external_target(
+            &base,
+            42,
+            &ExternalSource::DirectUrl {
+                url: "https://example.com/release.tar.gz".to_string(),
+            },
+        )
+        .expect("target should build");
+        assert_eq!(label, "release.tar.gz");
+        assert_eq!(target, base.join("release.tar.gz"));
+        assert_eq!(expected_size, None);
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn falls_back_to_message_id_when_url_has_no_filename() {
+        let base = unique_test_dir("direct-fallback");
+        fs::create_dir_all(&base).expect("test dir should be created");
+        let (label, target, _) = build_external_target(
+            &base,
+            99,
+            &ExternalSource::DirectUrl {
+                url: "https://example.com/downloads/".to_string(),
+            },
+        )
+        .expect("fallback target should build");
+        assert_eq!(label, "download_99");
+        assert_eq!(target, base.join("download_99"));
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn builds_magnet_directory_from_info_hash() {
+        let base = PathBuf::from("/tmp/test-downloads");
+        let (label, target, expected_size) = build_external_target(
+            &base,
+            1,
+            &ExternalSource::Magnet {
+                uri: "magnet:?xt=urn:btih:001122".to_string(),
+                info_hash: "001122".to_string(),
+            },
+        )
+        .expect("magnet target should build");
+        assert_eq!(label, "torrent_001122");
+        assert_eq!(target, base.join("torrents").join("001122"));
+        assert_eq!(expected_size, None);
+    }
+
+    #[test]
+    fn active_keys_cover_telegram_and_external_downloads() {
+        let telegram = ActiveDownloadKey::Telegram {
+            path: PathBuf::from("/tmp/photo.jpg"),
+            size: Some(10),
+        };
+        let direct = ActiveDownloadKey::External {
+            identity: "url:https://example.com/file.bin".to_string(),
+        };
+        let magnet = ActiveDownloadKey::External {
+            identity: "magnet:001122".to_string(),
+        };
+
+        assert_eq!(
+            telegram,
+            ActiveDownloadKey::Telegram {
+                path: PathBuf::from("/tmp/photo.jpg"),
+                size: Some(10),
+            }
+        );
+        assert_eq!(
+            direct,
+            ActiveDownloadKey::External {
+                identity: "url:https://example.com/file.bin".to_string(),
+            }
+        );
+        assert_eq!(
+            magnet,
+            ActiveDownloadKey::External {
+                identity: "magnet:001122".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn payload_detection_ignores_aria2_artifacts() {
+        let base = unique_test_dir("payload-check");
+        fs::create_dir_all(&base).expect("test dir should be created");
+        fs::write(base.join("partial.iso.aria2"), b"state").expect("artifact should be written");
+        assert!(!contains_payload_file(&base).expect("artifact-only dir should be empty"));
+
+        fs::write(base.join("real.iso"), b"payload").expect("payload should be written");
+        assert!(contains_payload_file(&base).expect("payload should be detected"));
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    fn unique_test_dir(prefix: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be monotonic enough for tests")
+            .as_nanos();
+        std::env::temp_dir().join(format!("telegram_downloader_{prefix}_{nanos}"))
+    }
 }

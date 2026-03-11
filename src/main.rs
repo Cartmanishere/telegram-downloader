@@ -10,9 +10,8 @@ use std::env;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let config_base_dir = load_runtime_env()?.unwrap_or(
-        env::current_dir().context("failed to resolve current working directory")?,
-    );
+    let config_base_dir = load_runtime_env()?
+        .unwrap_or(env::current_dir().context("failed to resolve current working directory")?);
     configure_logging();
 
     let config = AppConfig::from_env(&config_base_dir)?;

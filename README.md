@@ -5,8 +5,9 @@ Rust Telegram media downloader built on `grammers-client`.
 ## What It Does
 
 - Authenticates to Telegram as a bot
-- Listens for incoming bot-visible messages with photos or documents
+- Listens for incoming bot-visible messages with photos, documents, or supported links in message text/captions
 - Downloads media directly over MTProto
+- Delegates magnet links and direct `http` / `https` / `ftp` downloads to `aria2c`
 - Resumes partial downloads from `DOWNLOAD_DIR/.partial`
 - Sends Telegram replies for started, completed, failed, and duplicate downloads
 
@@ -15,6 +16,7 @@ Rust Telegram media downloader built on `grammers-client`.
 - Rust toolchain with `cargo`
 - A Telegram API ID and API hash
 - A Telegram bot token
+- `aria2c` available on `PATH`, or configured via `ARIA2C_PATH`
 
 ## Configuration
 
@@ -34,6 +36,8 @@ Optional variables:
 - `MAX_CONCURRENT_DOWNLOADS`: Parallel file downloads. Default: `2`
 - `PARALLEL_CHUNK_DOWNLOADS`: Segment workers per file. Default: `4`
 - `DOWNLOAD_CHUNK_SIZE_MB`: Per-request chunk size in MB. Default: `0.5`
+- `ARIA2C_PATH`: `aria2c` executable path. Default: `aria2c`
+- `ARIA2C_POLL_INTERVAL_MS`: Poll interval for `aria2c` RPC progress updates. Default: `1000`
 - `LOG_LEVEL`: Logging level. Default: `INFO`
 - `REPLY_ON_DUPLICATE`: Reply when a file already exists or is already downloading. Default: `true`
 
@@ -48,6 +52,8 @@ DOWNLOAD_DIR=./downloads-mtproto
 MAX_CONCURRENT_DOWNLOADS=2
 PARALLEL_CHUNK_DOWNLOADS=4
 DOWNLOAD_CHUNK_SIZE_MB=0.5
+ARIA2C_PATH=aria2c
+ARIA2C_POLL_INTERVAL_MS=1000
 LOG_LEVEL=INFO
 REPLY_ON_DUPLICATE=true
 ```
@@ -91,3 +97,10 @@ GitHub releases build and attach binaries for:
 
 - This app signs in as a bot, so it only receives updates Telegram delivers to bots.
 - Absolute paths in environment variables are used as-is.
+- When a message has Telegram media, the app keeps using the built-in MTProto downloader.
+- When a message has no downloadable Telegram media, the app scans raw text/caption content for:
+  - the first `magnet:` URI, or
+  - otherwise the first direct `http`, `https`, or `ftp` URL
+- Direct-link downloads are written into `DOWNLOAD_DIR` using the URL filename when possible, or `download_<message_id>` as a fallback.
+- Magnet downloads are stored under `DOWNLOAD_DIR/torrents/<info_hash>/`.
+- Telegram `text_link` formatting entities are not parsed in this version; only raw pasted links in message text/captions are recognized.

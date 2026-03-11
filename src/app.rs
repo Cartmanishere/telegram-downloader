@@ -1,11 +1,12 @@
 use crate::config::AppConfig;
 use crate::download::{
-    build_candidate, choose_target_path, download_with_resume, target_matches, ActiveDownloadKey,
+    classify_download_request, download_external_with_aria2, download_with_resume,
+    ActiveDownloadKey, DownloadRequest,
 };
 use crate::progress::{clear_terminal_line, ProgressTracker};
 use anyhow::{anyhow, Context, Result};
 use grammers_client::types::update::Message as UpdateMessage;
-use grammers_client::types::{Media, Message};
+use grammers_client::types::Message;
 use grammers_client::{Client, Update, UpdatesConfiguration};
 use grammers_mtsender::SenderPool;
 use grammers_session::storages::SqliteSession;
@@ -28,12 +29,10 @@ struct AppState {
 
 /// Authorize the Telegram client and start processing media messages forever.
 pub async fn run_app(config: AppConfig) -> Result<()> {
-    let session = Arc::new(SqliteSession::open(&config.session_path).with_context(|| {
-        format!(
-            "failed to open session {}",
-            config.session_path.display()
-        )
-    })?);
+    let session =
+        Arc::new(SqliteSession::open(&config.session_path).with_context(|| {
+            format!("failed to open session {}", config.session_path.display())
+        })?);
     let pool = SenderPool::new(Arc::clone(&session), config.api_id);
     let client = Client::new(&pool);
     let SenderPool {
@@ -45,7 +44,7 @@ pub async fn run_app(config: AppConfig) -> Result<()> {
     let mut update_stream = client.stream_updates(
         updates,
         UpdatesConfiguration {
-            catch_up: true,
+            catch_up: false,
             ..Default::default()
         },
     );
@@ -57,12 +56,13 @@ pub async fn run_app(config: AppConfig) -> Result<()> {
         .unwrap_or_else(|| me.raw.id().to_string());
     info!("Logged in as {}", login_label);
     info!(
-        "Download settings: workers={} segment_workers={} chunk_size={:.2} MB",
+        "Download settings: workers={} segment_workers={} chunk_size={:.2} MB aria2_poll={}ms",
         config.max_concurrent_downloads,
         config.parallel_chunk_downloads,
-        config.chunk_size as f64 / (1024.0 * 1024.0)
+        config.chunk_size as f64 / (1024.0 * 1024.0),
+        config.aria2c_poll_interval_ms,
     );
-    info!("Listening for incoming Telegram messages with downloadable media");
+    info!("Listening for incoming Telegram messages with media or supported links");
 
     let state = Arc::new(AppState {
         semaphore: Arc::new(Semaphore::new(config.max_concurrent_downloads)),
@@ -75,9 +75,6 @@ pub async fn run_app(config: AppConfig) -> Result<()> {
         let update = update_stream.next().await?;
         if let Update::NewMessage(message) = update {
             if message.outgoing() {
-                continue;
-            }
-            if !matches!(message.media(), Some(Media::Photo(_)) | Some(Media::Document(_))) {
                 continue;
             }
 
@@ -102,19 +99,12 @@ async fn authorize_client(client: &Client, config: &AppConfig) -> Result<()> {
 }
 
 async fn process_message(state: Arc<AppState>, message: UpdateMessage) -> Result<()> {
-    let media = message
-        .media()
-        .ok_or_else(|| anyhow!("message did not contain downloadable media"))?;
-    let candidate = build_candidate(&message, &media);
-    let target_path = choose_target_path(
-        &state.config.download_dir,
-        &candidate.filename,
-        candidate.file_size,
-    )?;
-    let key = ActiveDownloadKey {
-        path: target_path.clone(),
-        size: candidate.file_size,
+    let Some(request) = classify_download_request(&state.config, &message)? else {
+        return Ok(());
     };
+    let key = request.active_key();
+    let target_path = request.target_path().to_path_buf();
+    let expected_size = request.expected_size();
 
     {
         let mut active = state.active_downloads.lock().await;
@@ -130,7 +120,7 @@ async fn process_message(state: Arc<AppState>, message: UpdateMessage) -> Result
             return Ok(());
         }
 
-        if target_path.exists() && target_matches(&target_path, candidate.file_size)? {
+        if request.already_exists()? {
             if state.config.reply_on_duplicate {
                 let _ = message
                     .reply(format!(
@@ -146,23 +136,21 @@ async fn process_message(state: Arc<AppState>, message: UpdateMessage) -> Result
     }
 
     let permit = state.semaphore.clone().acquire_owned().await?;
-    let filename = target_path
-        .file_name()
-        .map(|value| value.to_string_lossy().into_owned())
-        .unwrap_or_else(|| candidate.filename.clone());
-    let tracker = ProgressTracker::new(filename.clone(), candidate.file_size);
-    let progress_message = message.reply(format!("Starting download: {filename}")).await.ok();
+    let filename = request.display_name();
+    let tracker = ProgressTracker::new(filename.clone(), expected_size);
+    let progress_message = message
+        .reply(format!("Starting download: {filename}"))
+        .await
+        .ok();
     let updater_handle = tokio::spawn(progress_message_updater(
         progress_message.clone(),
         tracker.clone(),
     ));
 
-    let result = download_with_resume(
+    let result = execute_download_request(
         state.client.clone(),
         state.config.clone(),
-        media,
-        &target_path,
-        candidate.file_size,
+        request,
         tracker.clone(),
     )
     .await;
@@ -174,9 +162,9 @@ async fn process_message(state: Arc<AppState>, message: UpdateMessage) -> Result
     match result {
         Ok(()) => {
             if !target_path.exists() {
-                return Err(anyhow!("download did not create the target file"));
+                return Err(anyhow!("download did not create the target path"));
             }
-            if let Some(expected_size) = candidate.file_size {
+            if let Some(expected_size) = expected_size {
                 let actual = fs::metadata(&target_path)?.len();
                 if actual != expected_size {
                     return Err(anyhow!(
@@ -190,7 +178,9 @@ async fn process_message(state: Arc<AppState>, message: UpdateMessage) -> Result
                     .edit(format!("Download complete: {filename}"))
                     .await;
             }
-            let _ = message.reply(format!("Download complete: {filename}")).await;
+            let _ = message
+                .reply(format!("Download complete: {filename}"))
+                .await;
         }
         Err(err) => {
             error!("Download failed for {}: {err:#}", filename);
@@ -208,6 +198,36 @@ async fn process_message(state: Arc<AppState>, message: UpdateMessage) -> Result
     let mut active = state.active_downloads.lock().await;
     active.remove(&key);
     Ok(())
+}
+
+async fn execute_download_request(
+    client: Client,
+    config: AppConfig,
+    request: DownloadRequest,
+    tracker: ProgressTracker,
+) -> Result<()> {
+    match request {
+        DownloadRequest::TelegramMedia {
+            media,
+            target_path,
+            candidate,
+        } => {
+            download_with_resume(
+                client,
+                config,
+                media,
+                &target_path,
+                candidate.file_size,
+                tracker,
+            )
+            .await
+        }
+        DownloadRequest::ExternalLink {
+            source,
+            target_path,
+            ..
+        } => download_external_with_aria2(config, source, &target_path, tracker).await,
+    }
 }
 
 async fn progress_message_updater(progress_message: Option<Message>, tracker: ProgressTracker) {
