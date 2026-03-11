@@ -10,6 +10,7 @@ Rust Telegram media downloader built on `grammers-client`.
 - Delegates magnet links and direct `http` / `https` / `ftp` downloads to `aria2c`
 - Resumes partial downloads from `DOWNLOAD_DIR/.partial`
 - Sends Telegram replies for started, completed, failed, and duplicate downloads
+- Prompts for `TV Show`, `Movie`, or `Anime` after each successful download and moves the payload into the configured library path
 
 ## Requirements
 
@@ -28,6 +29,9 @@ Required variables:
 - `TELEGRAM_API_ID`: Telegram API ID
 - `TELEGRAM_API_HASH`: Telegram API hash
 - `TELEGRAM_BOT_TOKEN`: Bot token used to sign in
+- `MOVIE_DIR`: Destination path for items classified as movies
+- `TV_SHOW_DIR`: Destination path for items classified as TV shows
+- `ANIME_DIR`: Destination path for items classified as anime
 
 Optional variables:
 
@@ -49,6 +53,9 @@ TELEGRAM_API_HASH=0123456789abcdef0123456789abcdef
 TELEGRAM_BOT_TOKEN=1234567890:AAExampleBotTokenValue
 TELEGRAM_SESSION_NAME=telegram_downloader.session
 DOWNLOAD_DIR=./downloads-mtproto
+MOVIE_DIR=./library/movies
+TV_SHOW_DIR=./library/tv
+ANIME_DIR=./library/anime
 MAX_CONCURRENT_DOWNLOADS=2
 PARALLEL_CHUNK_DOWNLOADS=4
 DOWNLOAD_CHUNK_SIZE_MB=0.5
@@ -103,4 +110,7 @@ GitHub releases build and attach binaries for:
   - otherwise the first direct `http`, `https`, or `ftp` URL
 - Direct-link downloads are written into `DOWNLOAD_DIR` using the URL filename when possible, or `download_<message_id>` as a fallback.
 - Magnet downloads are stored under `DOWNLOAD_DIR/torrents/<info_hash>/`.
+- After a successful download, the bot sends a Telegram prompt with `TV Show`, `Movie`, and `Anime` buttons. The original sender can also reply to that prompt with `TV Show`, `Movie`, or `Anime` as plain text.
+- When a magnet finishes, the bot classifies and moves the single top-level payload inside `DOWNLOAD_DIR/torrents/<info_hash>/`. If that directory is empty or contains multiple top-level payload entries, the bot reports that classification cannot proceed automatically.
+- The bot sends Telegram messages when a classified move starts and when it finishes or fails.
 - Telegram `text_link` formatting entities are not parsed in this version; only raw pasted links in message text/captions are recognized.

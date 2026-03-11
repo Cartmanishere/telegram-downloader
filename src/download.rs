@@ -9,6 +9,7 @@ use regex::Regex;
 use reqwest::{Client as HttpClient, Url};
 use serde::Deserialize;
 use serde_json::json;
+use std::ffi::OsStr;
 use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -37,6 +38,19 @@ pub struct DownloadCandidate {
 pub enum ExternalSource {
     DirectUrl { url: String },
     Magnet { uri: String, info_hash: String },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LibraryKind {
+    Movie,
+    TvShow,
+    Anime,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClassificationTarget {
+    pub source_path: PathBuf,
+    pub cleanup_dir: Option<PathBuf>,
 }
 
 #[derive(Clone)]
@@ -122,6 +136,25 @@ impl DownloadRequest {
                 ExternalSource::DirectUrl { .. } => target_matches(target_path, None),
                 ExternalSource::Magnet { .. } => contains_payload_file(target_path),
             },
+        }
+    }
+
+    pub fn resolve_classification_target(&self) -> Result<ClassificationTarget> {
+        match self {
+            Self::TelegramMedia { target_path, .. }
+            | Self::ExternalLink {
+                source: ExternalSource::DirectUrl { .. },
+                target_path,
+                ..
+            } => Ok(ClassificationTarget {
+                source_path: target_path.clone(),
+                cleanup_dir: None,
+            }),
+            Self::ExternalLink {
+                source: ExternalSource::Magnet { .. },
+                target_path,
+                ..
+            } => resolve_magnet_payload(target_path),
         }
     }
 }
@@ -312,6 +345,64 @@ pub fn target_matches(path: &Path, expected_size: Option<u64>) -> Result<bool> {
         Some(size) => Ok(fs::metadata(path)?.len() == size),
         None => Ok(true),
     }
+}
+
+pub fn choose_available_path(destination_dir: &Path, name: &OsStr) -> PathBuf {
+    let candidate = destination_dir.join(name);
+    if !candidate.exists() {
+        return candidate;
+    }
+
+    let path = Path::new(name);
+    let stem = path
+        .file_stem()
+        .map(|value| value.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "downloaded_file".to_string());
+    let suffix = path
+        .extension()
+        .map(|value| format!(".{}", value.to_string_lossy()))
+        .unwrap_or_default();
+
+    let mut counter = 1;
+    loop {
+        let numbered = destination_dir.join(format!("{stem}_{counter}{suffix}"));
+        if !numbered.exists() {
+            return numbered;
+        }
+        counter += 1;
+    }
+}
+
+pub fn move_classified_target(
+    config: &AppConfig,
+    target: &ClassificationTarget,
+    kind: LibraryKind,
+) -> Result<PathBuf> {
+    let destination_dir = match kind {
+        LibraryKind::Movie => &config.movie_dir,
+        LibraryKind::TvShow => &config.tv_show_dir,
+        LibraryKind::Anime => &config.anime_dir,
+    };
+    let file_name = target.source_path.file_name().ok_or_else(|| {
+        anyhow!(
+            "source path has no filename: {}",
+            target.source_path.display()
+        )
+    })?;
+    let destination_path = choose_available_path(destination_dir, file_name);
+    fs::rename(&target.source_path, &destination_path).with_context(|| {
+        format!(
+            "failed to move {} to {}",
+            target.source_path.display(),
+            destination_path.display()
+        )
+    })?;
+
+    if let Some(cleanup_dir) = &target.cleanup_dir {
+        remove_empty_directory(cleanup_dir)?;
+    }
+
+    Ok(destination_path)
 }
 
 /// Download a file, resuming partial work and using parallel segments when the total size is known.
@@ -743,6 +834,47 @@ fn contains_payload_file(path: &Path) -> Result<bool> {
     Ok(false)
 }
 
+fn resolve_magnet_payload(container_dir: &Path) -> Result<ClassificationTarget> {
+    if !container_dir.is_dir() {
+        bail!(
+            "magnet download did not create a torrent directory at {}",
+            container_dir.display()
+        );
+    }
+
+    let entries = fs::read_dir(container_dir)?
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| !is_aria2_artifact(path))
+        .collect::<Vec<_>>();
+
+    match entries.as_slice() {
+        [] => bail!(
+            "torrent payload directory is empty: {}",
+            container_dir.display()
+        ),
+        [payload] => Ok(ClassificationTarget {
+            source_path: payload.clone(),
+            cleanup_dir: Some(container_dir.to_path_buf()),
+        }),
+        _ => bail!(
+            "torrent payload is ambiguous in {}; expected exactly one top-level file or folder",
+            container_dir.display()
+        ),
+    }
+}
+
+fn remove_empty_directory(path: &Path) -> Result<()> {
+    if !path.is_dir() {
+        return Ok(());
+    }
+    if fs::read_dir(path)?.next().is_none() {
+        fs::remove_dir(path)
+            .with_context(|| format!("failed to remove empty directory {}", path.display()))?;
+    }
+    Ok(())
+}
+
 fn is_aria2_artifact(path: &Path) -> bool {
     path.file_name()
         .map(|name| {
@@ -858,11 +990,14 @@ async fn rpc_call<T: for<'de> Deserialize<'de>>(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_external_target, contains_payload_file, extract_external_link, ActiveDownloadKey,
-        ExternalSource,
+        build_external_target, choose_available_path, contains_payload_file, extract_external_link,
+        move_classified_target, resolve_magnet_payload, ActiveDownloadKey, ClassificationTarget,
+        ExternalSource, LibraryKind,
     };
+    use crate::config::AppConfig;
+    use std::ffi::OsStr;
     use std::fs;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -1007,11 +1142,205 @@ mod tests {
         let _ = fs::remove_dir_all(&base);
     }
 
+    #[test]
+    fn resolve_magnet_payload_returns_single_file() {
+        let base = unique_test_dir("magnet-payload-file");
+        let container = base.join("hash");
+        fs::create_dir_all(&container).expect("container should exist");
+        let payload = container.join("episode.mkv");
+        fs::write(&payload, b"payload").expect("payload should be written");
+
+        let target = resolve_magnet_payload(&container).expect("payload should resolve");
+        assert_eq!(
+            target,
+            ClassificationTarget {
+                source_path: payload,
+                cleanup_dir: Some(container),
+            }
+        );
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn resolve_magnet_payload_returns_single_directory() {
+        let base = unique_test_dir("magnet-payload-dir");
+        let container = base.join("hash");
+        let payload = container.join("Season 1");
+        fs::create_dir_all(&payload).expect("payload dir should exist");
+
+        let target = resolve_magnet_payload(&container).expect("payload should resolve");
+        assert_eq!(target.source_path, payload);
+        assert_eq!(target.cleanup_dir, Some(container));
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn resolve_magnet_payload_rejects_empty_directory() {
+        let base = unique_test_dir("magnet-empty");
+        let container = base.join("hash");
+        fs::create_dir_all(&container).expect("container should exist");
+
+        let error = resolve_magnet_payload(&container).expect_err("empty container should fail");
+        assert!(error.to_string().contains("empty"));
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn resolve_magnet_payload_rejects_multiple_top_level_entries() {
+        let base = unique_test_dir("magnet-many");
+        let container = base.join("hash");
+        fs::create_dir_all(&container).expect("container should exist");
+        fs::write(container.join("a.mkv"), b"a").expect("first payload should be written");
+        fs::write(container.join("b.mkv"), b"b").expect("second payload should be written");
+
+        let error =
+            resolve_magnet_payload(&container).expect_err("multi-entry container should fail");
+        assert!(error.to_string().contains("ambiguous"));
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn choose_available_path_adds_numeric_suffix() {
+        let base = unique_test_dir("available-path");
+        fs::create_dir_all(&base).expect("base should exist");
+        fs::write(base.join("movie.mkv"), b"payload").expect("existing file should be written");
+
+        let chosen = choose_available_path(&base, OsStr::new("movie.mkv"));
+        assert_eq!(chosen, base.join("movie_1.mkv"));
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn move_classified_target_moves_file_to_movie_dir() {
+        let base = unique_test_dir("move-file");
+        let config = test_config(&base);
+        fs::create_dir_all(&config.movie_dir).expect("movie dir should exist");
+        fs::create_dir_all(&config.tv_show_dir).expect("tv dir should exist");
+        fs::create_dir_all(&config.anime_dir).expect("anime dir should exist");
+        let source = base.join("downloads").join("movie.mkv");
+        fs::create_dir_all(source.parent().unwrap()).expect("downloads dir should exist");
+        fs::write(&source, b"payload").expect("source should exist");
+
+        let destination = move_classified_target(
+            &config,
+            &ClassificationTarget {
+                source_path: source.clone(),
+                cleanup_dir: None,
+            },
+            LibraryKind::Movie,
+        )
+        .expect("move should succeed");
+
+        assert_eq!(destination, config.movie_dir.join("movie.mkv"));
+        assert!(destination.exists());
+        assert!(!source.exists());
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn move_classified_target_removes_empty_magnet_container() {
+        let base = unique_test_dir("move-magnet");
+        let config = test_config(&base);
+        fs::create_dir_all(&config.movie_dir).expect("movie dir should exist");
+        fs::create_dir_all(&config.tv_show_dir).expect("tv dir should exist");
+        fs::create_dir_all(&config.anime_dir).expect("anime dir should exist");
+        let container = base.join("downloads").join("torrents").join("abc");
+        fs::create_dir_all(&container).expect("container should exist");
+        let source = container.join("Show");
+        fs::create_dir_all(&source).expect("payload dir should exist");
+
+        let destination = move_classified_target(
+            &config,
+            &ClassificationTarget {
+                source_path: source.clone(),
+                cleanup_dir: Some(container.clone()),
+            },
+            LibraryKind::TvShow,
+        )
+        .expect("move should succeed");
+
+        assert_eq!(destination, config.tv_show_dir.join("Show"));
+        assert!(destination.exists());
+        assert!(!container.exists());
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn move_classified_target_avoids_overwrite() {
+        let base = unique_test_dir("move-collision");
+        let config = test_config(&base);
+        fs::create_dir_all(&config.movie_dir).expect("movie dir should exist");
+        fs::create_dir_all(&config.tv_show_dir).expect("tv dir should exist");
+        fs::create_dir_all(&config.anime_dir).expect("anime dir should exist");
+        fs::write(config.movie_dir.join("movie.mkv"), b"existing").expect("existing file");
+        let source = base.join("downloads").join("movie.mkv");
+        fs::create_dir_all(source.parent().unwrap()).expect("downloads dir should exist");
+        fs::write(&source, b"payload").expect("source should exist");
+
+        let destination = move_classified_target(
+            &config,
+            &ClassificationTarget {
+                source_path: source,
+                cleanup_dir: None,
+            },
+            LibraryKind::Movie,
+        )
+        .expect("move should succeed");
+
+        assert_eq!(destination, config.movie_dir.join("movie_1.mkv"));
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn move_classified_target_moves_directory_to_anime_dir() {
+        let base = unique_test_dir("move-anime");
+        let config = test_config(&base);
+        fs::create_dir_all(&config.movie_dir).expect("movie dir should exist");
+        fs::create_dir_all(&config.tv_show_dir).expect("tv dir should exist");
+        fs::create_dir_all(&config.anime_dir).expect("anime dir should exist");
+        let source = base.join("downloads").join("Anime Series");
+        fs::create_dir_all(&source).expect("anime source should exist");
+
+        let destination = move_classified_target(
+            &config,
+            &ClassificationTarget {
+                source_path: source.clone(),
+                cleanup_dir: None,
+            },
+            LibraryKind::Anime,
+        )
+        .expect("move should succeed");
+
+        assert_eq!(destination, config.anime_dir.join("Anime Series"));
+        assert!(destination.exists());
+        assert!(!source.exists());
+        let _ = fs::remove_dir_all(&base);
+    }
+
     fn unique_test_dir(prefix: &str) -> PathBuf {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock should be monotonic enough for tests")
             .as_nanos();
         std::env::temp_dir().join(format!("telegram_downloader_{prefix}_{nanos}"))
+    }
+
+    fn test_config(base: &Path) -> AppConfig {
+        AppConfig {
+            api_id: 1,
+            api_hash: "hash".to_string(),
+            bot_token: "token".to_string(),
+            session_path: base.join("session"),
+            download_dir: base.join("downloads"),
+            movie_dir: base.join("movies"),
+            tv_show_dir: base.join("shows"),
+            anime_dir: base.join("anime"),
+            max_concurrent_downloads: 1,
+            parallel_chunk_downloads: 1,
+            chunk_size: 512 * 1024,
+            aria2c_path: "aria2c".to_string(),
+            aria2c_poll_interval_ms: 1000,
+            reply_on_duplicate: true,
+        }
     }
 }

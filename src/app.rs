@@ -1,18 +1,22 @@
 use crate::config::AppConfig;
 use crate::download::{
     classify_download_request, download_external_with_aria2, download_with_resume,
-    ActiveDownloadKey, DownloadRequest,
+    move_classified_target, ActiveDownloadKey, ClassificationTarget, DownloadRequest, LibraryKind,
 };
 use crate::progress::{clear_terminal_line, ProgressTracker};
 use anyhow::{anyhow, Context, Result};
+use grammers_client::grammers_tl_types as tl;
+use grammers_client::types::update::CallbackQuery;
 use grammers_client::types::update::Message as UpdateMessage;
 use grammers_client::types::Message;
-use grammers_client::{Client, Update, UpdatesConfiguration};
+use grammers_client::{button, reply_markup, Client, InputMessage, Update, UpdatesConfiguration};
 use grammers_mtsender::SenderPool;
+use grammers_session::defs::PeerId;
 use grammers_session::storages::SqliteSession;
 use log::{error, info};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, Semaphore};
@@ -25,6 +29,85 @@ struct AppState {
     client: Client,
     semaphore: Arc<Semaphore>,
     active_downloads: Arc<Mutex<HashSet<ActiveDownloadKey>>>,
+    pending_classifications: Arc<Mutex<HashMap<u64, PendingClassification>>>,
+    next_classification_id: AtomicU64,
+}
+
+#[derive(Clone)]
+struct PendingClassification {
+    original_sender_id: PeerId,
+    display_name: String,
+    target: ClassificationTarget,
+    prompt_message: Message,
+    prompt_message_id: i32,
+}
+
+#[derive(Clone, Copy)]
+enum ClassificationChoice {
+    Movie,
+    TvShow,
+    Anime,
+}
+
+impl ClassificationChoice {
+    fn from_callback_data(data: &[u8]) -> Option<(u64, Self)> {
+        let raw = std::str::from_utf8(data).ok()?;
+        let (prefix, job_id, kind) = raw.split_once(':').and_then(|(prefix, rest)| {
+            let (job_id, kind) = rest.split_once(':')?;
+            Some((prefix, job_id, kind))
+        })?;
+        if prefix != "classify" {
+            return None;
+        }
+
+        let job_id = job_id.parse().ok()?;
+        let kind = match kind {
+            "movie" => Self::Movie,
+            "tv" => Self::TvShow,
+            "anime" => Self::Anime,
+            _ => return None,
+        };
+        Some((job_id, kind))
+    }
+
+    fn from_text(text: &str) -> Option<Self> {
+        match text.trim().to_ascii_lowercase().as_str() {
+            "movie" => Some(Self::Movie),
+            "tv show" | "tv" | "show" => Some(Self::TvShow),
+            "anime" => Some(Self::Anime),
+            _ => None,
+        }
+    }
+
+    fn to_library_kind(self) -> LibraryKind {
+        match self {
+            Self::Movie => LibraryKind::Movie,
+            Self::TvShow => LibraryKind::TvShow,
+            Self::Anime => LibraryKind::Anime,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Movie => "Movie",
+            Self::TvShow => "TV Show",
+            Self::Anime => "Anime",
+        }
+    }
+}
+
+fn utf16_len(text: &str) -> i32 {
+    text.encode_utf16().count() as i32
+}
+
+fn code_message(prefix: &str, name: &str, suffix: &str) -> InputMessage {
+    InputMessage::new()
+        .text(format!("{prefix}{name}{suffix}"))
+        .fmt_entities(vec![tl::types::MessageEntityCode {
+            offset: utf16_len(prefix),
+            length: utf16_len(name),
+        }
+        .into()])
 }
 
 /// Authorize the Telegram client and start processing media messages forever.
@@ -67,23 +150,36 @@ pub async fn run_app(config: AppConfig) -> Result<()> {
     let state = Arc::new(AppState {
         semaphore: Arc::new(Semaphore::new(config.max_concurrent_downloads)),
         active_downloads: Arc::new(Mutex::new(HashSet::new())),
+        pending_classifications: Arc::new(Mutex::new(HashMap::new())),
+        next_classification_id: AtomicU64::new(1),
         config,
         client: client.clone(),
     });
 
     loop {
         let update = update_stream.next().await?;
-        if let Update::NewMessage(message) = update {
-            if message.outgoing() {
-                continue;
-            }
-
-            let state = Arc::clone(&state);
-            tokio::spawn(async move {
-                if let Err(err) = process_message(state, message).await {
-                    error!("message processing failed: {err:#}");
+        match update {
+            Update::NewMessage(message) => {
+                if message.outgoing() {
+                    continue;
                 }
-            });
+
+                let state = Arc::clone(&state);
+                tokio::spawn(async move {
+                    if let Err(err) = process_message(state, message).await {
+                        error!("message processing failed: {err:#}");
+                    }
+                });
+            }
+            Update::CallbackQuery(query) => {
+                let state = Arc::clone(&state);
+                tokio::spawn(async move {
+                    if let Err(err) = process_callback_query(state, query).await {
+                        error!("callback query processing failed: {err:#}");
+                    }
+                });
+            }
+            _ => {}
         }
     }
 }
@@ -99,6 +195,10 @@ async fn authorize_client(client: &Client, config: &AppConfig) -> Result<()> {
 }
 
 async fn process_message(state: Arc<AppState>, message: UpdateMessage) -> Result<()> {
+    if try_handle_text_classification_reply(&state, &message).await? {
+        return Ok(());
+    }
+
     let Some(request) = classify_download_request(&state.config, &message)? else {
         return Ok(());
     };
@@ -111,9 +211,10 @@ async fn process_message(state: Arc<AppState>, message: UpdateMessage) -> Result
         if active.contains(&key) {
             if state.config.reply_on_duplicate {
                 let _ = message
-                    .reply(format!(
-                        "Download is already in progress for {}.",
-                        target_path.file_name().unwrap().to_string_lossy()
+                    .reply(code_message(
+                        "⏳ Download already in progress for ",
+                        &target_path.file_name().unwrap().to_string_lossy(),
+                        ".",
                     ))
                     .await;
             }
@@ -123,9 +224,10 @@ async fn process_message(state: Arc<AppState>, message: UpdateMessage) -> Result
         if request.already_exists()? {
             if state.config.reply_on_duplicate {
                 let _ = message
-                    .reply(format!(
-                        "Download already exists for {}.",
-                        target_path.file_name().unwrap().to_string_lossy()
+                    .reply(code_message(
+                        "📁 Download already exists for ",
+                        &target_path.file_name().unwrap().to_string_lossy(),
+                        ".",
                     ))
                     .await;
             }
@@ -138,8 +240,9 @@ async fn process_message(state: Arc<AppState>, message: UpdateMessage) -> Result
     let permit = state.semaphore.clone().acquire_owned().await?;
     let filename = request.display_name();
     let tracker = ProgressTracker::new(filename.clone(), expected_size);
+    let request_for_classification = request.clone();
     let progress_message = message
-        .reply(format!("Starting download: {filename}"))
+        .reply(code_message("⬇️ Starting download: ", &filename, ""))
         .await
         .ok();
     let updater_handle = tokio::spawn(progress_message_updater(
@@ -175,22 +278,86 @@ async fn process_message(state: Arc<AppState>, message: UpdateMessage) -> Result
             info!("Download complete for {}", filename);
             if let Some(progress_message) = progress_message.clone() {
                 let _ = progress_message
-                    .edit(format!("Download complete: {filename}"))
+                    .edit(code_message("✅ Download complete: ", &filename, ""))
                     .await;
             }
-            let _ = message
-                .reply(format!("Download complete: {filename}"))
+            let completion_message = message
+                .reply(code_message("✅ Download complete: ", &filename, ""))
                 .await;
+            let classification_target = request_for_classification.resolve_classification_target();
+            match classification_target {
+                Ok(target) => {
+                    let prompt_target_name = target
+                        .source_path
+                        .file_name()
+                        .map(|value| value.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| filename.clone());
+                    let prompt_reply_target = completion_message.as_ref().unwrap_or(&message);
+                    if let Some(original_sender_id) = message.sender().map(|sender| sender.id()) {
+                        if let Err(err) = queue_classification_prompt(
+                            &state,
+                            prompt_reply_target,
+                            original_sender_id,
+                            prompt_target_name,
+                            target,
+                        )
+                        .await
+                        {
+                            error!(
+                                "failed to send classification prompt for {}: {err:#}",
+                                filename
+                            );
+                            let _ = message
+                                .reply(code_message(
+                                    "⚠️ Download complete, but classification prompt failed for ",
+                                    &filename,
+                                    &format!(": {err}"),
+                                ))
+                                .await;
+                        }
+                    } else {
+                        error!("unable to determine original sender for {}", filename);
+                        let _ = message
+                            .reply(code_message(
+                                "⚠️ Download complete, but classification is unavailable for ",
+                                &filename,
+                                ": unable to determine sender",
+                            ))
+                            .await;
+                    }
+                }
+                Err(err) => {
+                    error!(
+                        "failed to resolve classification target for {}: {err:#}",
+                        filename
+                    );
+                    let _ = message
+                        .reply(code_message(
+                            "⚠️ Download complete, but classification is unavailable for ",
+                            &filename,
+                            &format!(": {err}"),
+                        ))
+                        .await;
+                }
+            }
         }
         Err(err) => {
             error!("Download failed for {}: {err:#}", filename);
             if let Some(progress_message) = progress_message.clone() {
                 let _ = progress_message
-                    .edit(format!("Download failed for {filename}: {err}"))
+                    .edit(code_message(
+                        "❌ Download failed for ",
+                        &filename,
+                        &format!(": {err}"),
+                    ))
                     .await;
             }
             let _ = message
-                .reply(format!("Download failed for {filename}: {err}"))
+                .reply(code_message(
+                    "❌ Download failed for ",
+                    &filename,
+                    &format!(": {err}"),
+                ))
                 .await;
         }
     }
@@ -198,6 +365,177 @@ async fn process_message(state: Arc<AppState>, message: UpdateMessage) -> Result
     let mut active = state.active_downloads.lock().await;
     active.remove(&key);
     Ok(())
+}
+
+async fn queue_classification_prompt(
+    state: &Arc<AppState>,
+    reply_target: &Message,
+    original_sender_id: PeerId,
+    display_name: String,
+    target: ClassificationTarget,
+) -> Result<()> {
+    let job_id = state.next_classification_id.fetch_add(1, Ordering::Relaxed);
+    let markup = reply_markup::inline(vec![vec![
+        button::inline("TV Show", format!("classify:{job_id}:tv").into_bytes()),
+        button::inline("Movie", format!("classify:{job_id}:movie").into_bytes()),
+        button::inline("Anime", format!("classify:{job_id}:anime").into_bytes()),
+    ]]);
+    let prompt_message = reply_target
+        .reply(
+            code_message(
+                "🗂️ Classify ",
+                &display_name,
+                " as TV Show, Movie, or Anime.\nYou can also reply with `TV Show`, `Movie`, or `Anime`.",
+            )
+                .reply_markup(&markup),
+        )
+        .await?;
+
+    let pending = PendingClassification {
+        original_sender_id,
+        display_name,
+        target,
+        prompt_message: prompt_message.clone(),
+        prompt_message_id: prompt_message.id(),
+    };
+    state
+        .pending_classifications
+        .lock()
+        .await
+        .insert(job_id, pending);
+    Ok(())
+}
+
+async fn try_handle_text_classification_reply(
+    state: &Arc<AppState>,
+    message: &UpdateMessage,
+) -> Result<bool> {
+    let Some(choice) = ClassificationChoice::from_text(message.text()) else {
+        return Ok(false);
+    };
+    let Some(reply_to_message_id) = message.reply_to_message_id() else {
+        return Ok(false);
+    };
+    let Some(sender_id) = message.sender().map(|sender| sender.id()) else {
+        return Ok(false);
+    };
+
+    let job_id = {
+        let pending = state.pending_classifications.lock().await;
+        pending.iter().find_map(|(job_id, job)| {
+            (job.prompt_message_id == reply_to_message_id).then_some(*job_id)
+        })
+    };
+    let Some(job_id) = job_id else {
+        return Ok(false);
+    };
+
+    complete_classification_job(state, job_id, choice, sender_id, Some(message)).await?;
+    Ok(true)
+}
+
+async fn process_callback_query(state: Arc<AppState>, query: CallbackQuery) -> Result<()> {
+    let Some((job_id, choice)) = ClassificationChoice::from_callback_data(query.data()) else {
+        query.answer().text("Unknown action.").send().await?;
+        return Ok(());
+    };
+    let sender_id = query.sender().id();
+    let response = complete_classification_job(&state, job_id, choice, sender_id, None).await?;
+    query.answer().text(response).send().await?;
+    Ok(())
+}
+
+async fn complete_classification_job(
+    state: &Arc<AppState>,
+    job_id: u64,
+    choice: ClassificationChoice,
+    sender_id: PeerId,
+    reply_message: Option<&UpdateMessage>,
+) -> Result<&'static str> {
+    let pending = {
+        let pending_map = state.pending_classifications.lock().await;
+        pending_map.get(&job_id).cloned()
+    };
+    let Some(pending) = pending else {
+        if let Some(message) = reply_message {
+            let _ = message
+                .reply("⌛ That classification request is no longer active.")
+                .await;
+        }
+        return Ok("⌛ That request is no longer active.");
+    };
+
+    if pending.original_sender_id != sender_id {
+        if let Some(message) = reply_message {
+            let _ = message
+                .reply("🔒 Only the original sender can classify this download.")
+                .await;
+        }
+        return Ok("🔒 Only the original sender can classify this download.");
+    }
+
+    let starting_message = code_message(
+        "🚚 Starting move: ",
+        &pending.display_name,
+        &format!(" -> {}", choice.label()),
+    );
+    info!(
+        "Starting move for {} to {} from {}",
+        pending.display_name,
+        choice.label(),
+        pending.target.source_path.display()
+    );
+    send_classification_status(state, &pending, starting_message).await;
+
+    match move_classified_target(&state.config, &pending.target, choice.to_library_kind()) {
+        Ok(destination_path) => {
+            state.pending_classifications.lock().await.remove(&job_id);
+            info!(
+                "Move complete for {} to {}",
+                pending.display_name,
+                destination_path.display()
+            );
+            let completion_message = code_message(
+                "📦 Move complete: ",
+                &pending.display_name,
+                &format!(" -> {}", destination_path.display()),
+            );
+            send_classification_status(state, &pending, completion_message).await;
+            hide_classification_prompt(state, &pending).await;
+            Ok("📦 Move completed.")
+        }
+        Err(err) => {
+            state.pending_classifications.lock().await.remove(&job_id);
+            error!("Move failed for {}: {err:#}", pending.display_name);
+            let failure_message = code_message(
+                "❌ Move failed for ",
+                &pending.display_name,
+                &format!(": {err}"),
+            );
+            send_classification_status(state, &pending, failure_message).await;
+            hide_classification_prompt(state, &pending).await;
+            Ok("❌ Move failed.")
+        }
+    }
+}
+
+async fn send_classification_status(
+    _state: &Arc<AppState>,
+    pending: &PendingClassification,
+    message: InputMessage,
+) {
+    let _ = pending.prompt_message.reply(message).await;
+}
+
+async fn hide_classification_prompt(_state: &Arc<AppState>, pending: &PendingClassification) {
+    let _ = pending
+        .prompt_message
+        .edit(code_message(
+            "✅ Classification handled for ",
+            &pending.display_name,
+            ".",
+        ))
+        .await;
 }
 
 async fn execute_download_request(
@@ -239,7 +577,7 @@ async fn progress_message_updater(progress_message: Option<Message>, tracker: Pr
     loop {
         tokio::time::sleep(Duration::from_secs(PROGRESS_EDIT_INTERVAL_SECONDS)).await;
         let current_text = format!(
-            "Download in progress: {}",
+            "⏳ Download in progress: {}",
             tracker.current_status_text().await
         );
         if current_text == last_sent_text {
