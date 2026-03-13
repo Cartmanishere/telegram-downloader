@@ -8,6 +8,7 @@ Rust Telegram media downloader built on `grammers-client`.
 - Listens for incoming bot-visible messages with photos, documents, or supported links in message text/captions
 - Downloads media directly over MTProto
 - Delegates magnet links and direct `http` / `https` / `ftp` downloads to `aria2c`
+- Delegates `https://mega.nz/` links to `megadl` and mirrors its per-file progress into Telegram
 - Resumes partial downloads from `DOWNLOAD_DIR/.partial`
 - Sends Telegram replies for started, completed, failed, and duplicate downloads
 - Prompts for `TV Show`, `Movie`, or `Anime` after each successful download and moves the payload into the configured library path
@@ -18,6 +19,7 @@ Rust Telegram media downloader built on `grammers-client`.
 - A Telegram API ID and API hash
 - A Telegram bot token
 - `aria2c` available on `PATH`, or configured via `ARIA2C_PATH`
+- `megadl` available on `PATH`, or configured via `MEGADL_PATH`
 - `rsync` available on `PATH` for classified post-download moves
 
 ## Configuration
@@ -43,6 +45,7 @@ Optional variables:
 - `DOWNLOAD_CHUNK_SIZE_MB`: Per-request chunk size in MB. Default: `0.5`
 - `ARIA2C_PATH`: `aria2c` executable path. Default: `aria2c`
 - `ARIA2C_POLL_INTERVAL_MS`: Poll interval for `aria2c` RPC progress updates. Default: `1000`
+- `MEGADL_PATH`: `megadl` executable path. Default: `megadl`
 - `LOG_LEVEL`: Logging level. Default: `INFO`
 - `REPLY_ON_DUPLICATE`: Reply when a file already exists or is already downloading. Default: `true`
 
@@ -62,6 +65,7 @@ PARALLEL_CHUNK_DOWNLOADS=4
 DOWNLOAD_CHUNK_SIZE_MB=0.5
 ARIA2C_PATH=aria2c
 ARIA2C_POLL_INTERVAL_MS=1000
+MEGADL_PATH=megadl
 LOG_LEVEL=INFO
 REPLY_ON_DUPLICATE=true
 ```
@@ -108,9 +112,11 @@ GitHub releases build and attach binaries for:
 - When a message has Telegram media, the app keeps using the built-in MTProto downloader.
 - When a message has no downloadable Telegram media, the app scans raw text/caption content for:
   - the first `magnet:` URI, or
+  - otherwise the first `https://mega.nz/` URL, or
   - otherwise the first direct `http`, `https`, or `ftp` URL
 - Direct-link downloads are written into `DOWNLOAD_DIR` using the URL filename when possible, or `download_<message_id>` as a fallback.
 - Magnet downloads are stored under `DOWNLOAD_DIR/torrents/<info_hash>/`.
+- MEGA downloads are stored under `DOWNLOAD_DIR/mega/mega_<message_id>/`, then renamed to a friendlier wrapper directory inferred from the downloaded content before classification.
 - After a successful download, the bot sends a Telegram prompt with `TV Show`, `Movie`, and `Anime` buttons. The original sender can also reply to that prompt with `TV Show`, `Movie`, or `Anime` as plain text.
 - Classified moves are delegated to `rsync -avh --progress --remove-source-files`, and the bot replies in Telegram after the move completes or fails.
 - When a magnet finishes, the bot classifies and moves the single top-level payload inside `DOWNLOAD_DIR/torrents/<info_hash>/`. If that directory is empty or contains multiple top-level payload entries, the bot reports that classification cannot proceed automatically.

@@ -1,7 +1,7 @@
 use crate::config::AppConfig;
 use crate::download::{
-    classify_download_request, download_external_with_aria2, download_with_resume,
-    is_download_cancelled, move_classified_target, ActiveDownloadKey, ClassificationTarget,
+    classify_download_request, download_external, download_with_resume, is_download_cancelled,
+    move_classified_target, resolve_mega_payload, ActiveDownloadKey, ClassificationTarget,
     DownloadCancellation, DownloadRequest, LibraryKind,
 };
 use crate::progress::{clear_terminal_line, ProgressTracker};
@@ -304,12 +304,12 @@ async fn process_message(state: Arc<AppState>, message: UpdateMessage) -> Result
         .remove(&download_id);
 
     match result {
-        Ok(()) => {
-            if !target_path.exists() {
+        Ok(final_target_path) => {
+            if !final_target_path.exists() {
                 return Err(anyhow!("download did not create the target path"));
             }
             if let Some(expected_size) = expected_size {
-                let actual = fs::metadata(&target_path)?.len();
+                let actual = fs::metadata(&final_target_path)?.len();
                 if actual != expected_size {
                     return Err(anyhow!(
                         "size mismatch after transfer: expected={expected_size} actual={actual}"
@@ -325,7 +325,13 @@ async fn process_message(state: Arc<AppState>, message: UpdateMessage) -> Result
             let completion_message = message
                 .reply(code_message("✅ Download complete: ", &filename, ""))
                 .await;
-            let classification_target = request_for_classification.resolve_classification_target();
+            let classification_target = match request_for_classification {
+                DownloadRequest::ExternalLink {
+                    source: crate::download::ExternalSource::Mega { .. },
+                    ..
+                } => resolve_mega_payload(&final_target_path),
+                _ => request_for_classification.resolve_classification_target(),
+            };
             match classification_target {
                 Ok(target) => {
                     let prompt_target_name = target
@@ -651,7 +657,7 @@ async fn execute_download_request(
     request: DownloadRequest,
     tracker: ProgressTracker,
     cancellation: DownloadCancellation,
-) -> Result<()> {
+) -> Result<std::path::PathBuf> {
     match request {
         DownloadRequest::TelegramMedia {
             media,
@@ -667,15 +673,14 @@ async fn execute_download_request(
                 tracker,
                 cancellation,
             )
-            .await
+            .await?;
+            Ok(target_path)
         }
         DownloadRequest::ExternalLink {
             source,
             target_path,
             ..
-        } => {
-            download_external_with_aria2(config, source, &target_path, tracker, cancellation).await
-        }
+        } => download_external(config, source, &target_path, tracker, cancellation).await,
     }
 }
 

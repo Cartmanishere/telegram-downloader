@@ -9,10 +9,12 @@ use regex::Regex;
 use reqwest::{Client as HttpClient, Url};
 use serde::Deserialize;
 use serde_json::json;
+use std::collections::VecDeque;
 use std::ffi::OsStr;
 use std::fmt;
 use std::fs;
 use std::net::SocketAddr;
+use std::path::Component;
 use std::path::{Path, PathBuf};
 use std::process::{Command as StdCommand, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -42,6 +44,7 @@ pub struct DownloadCandidate {
 pub enum ExternalSource {
     DirectUrl { url: String },
     Magnet { uri: String, info_hash: String },
+    Mega { url: String },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -178,6 +181,7 @@ impl DownloadRequest {
             } => match source {
                 ExternalSource::DirectUrl { .. } => target_matches(target_path, None),
                 ExternalSource::Magnet { .. } => contains_payload_file(target_path),
+                ExternalSource::Mega { .. } => Ok(false),
             },
         }
     }
@@ -198,6 +202,11 @@ impl DownloadRequest {
                 target_path,
                 ..
             } => resolve_magnet_payload(target_path),
+            Self::ExternalLink {
+                source: ExternalSource::Mega { .. },
+                target_path,
+                ..
+            } => resolve_mega_payload(target_path),
         }
     }
 }
@@ -222,6 +231,18 @@ struct AriaSnapshot {
     stopped: Vec<AriaStatus>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct MegaProgressSnapshot {
+    pub current_item_label: String,
+    pub downloaded_bytes: u64,
+    pub total_bytes: Option<u64>,
+    pub speed_mb_s: Option<f64>,
+}
+
+struct ProcessOutputCapture {
+    tail: Vec<String>,
+}
+
 impl AriaSnapshot {
     fn is_terminal(&self) -> bool {
         self.active.is_empty()
@@ -240,8 +261,17 @@ static MAGNET_LINK_RE: once_cell::sync::Lazy<Regex> = once_cell::sync::Lazy::new
 static DIRECT_LINK_RE: once_cell::sync::Lazy<Regex> = once_cell::sync::Lazy::new(|| {
     Regex::new(r"(?i)\b(?:https?|ftp)://[^\s<>]+").expect("direct-link regex should compile")
 });
+static MEGA_LINK_RE: once_cell::sync::Lazy<Regex> = once_cell::sync::Lazy::new(|| {
+    Regex::new(r"(?i)\bhttps://mega\.nz/[^\s<>]+").expect("mega regex should compile")
+});
 static BTIH_RE: once_cell::sync::Lazy<Regex> = once_cell::sync::Lazy::new(|| {
     Regex::new(r"(?i)(?:^|&)xt=urn:btih:([^&]+)").expect("btih regex should compile")
+});
+static MEGA_PROGRESS_RE: once_cell::sync::Lazy<Regex> = once_cell::sync::Lazy::new(|| {
+    Regex::new(
+        r"^(?P<name>.+?):\s+(?P<percent>\d+(?:\.\d+)?)%\s+-\s+(?P<human_downloaded>.+?)\s+\((?P<downloaded_bytes>[\d,]+)\s+bytes\)\s+of\s+(?P<human_total>.+?)\s+\((?P<speed>.+?)/s\)\s*$",
+    )
+    .expect("mega progress regex should compile")
 });
 
 /// Build a human-friendly filename and expected size from Telegram media metadata.
@@ -314,6 +344,13 @@ pub fn extract_external_link(text: &str) -> Option<ExternalSource> {
         });
     }
 
+    if let Some(mat) = MEGA_LINK_RE.find(text) {
+        let url = trim_link_punctuation(mat.as_str());
+        return Some(ExternalSource::Mega {
+            url: url.to_string(),
+        });
+    }
+
     let direct = DIRECT_LINK_RE.find(text)?;
     let url = trim_link_punctuation(direct.as_str());
     let parsed = Url::parse(url).ok()?;
@@ -325,7 +362,7 @@ pub fn extract_external_link(text: &str) -> Option<ExternalSource> {
     }
 }
 
-fn build_external_target(
+pub fn build_external_target(
     download_dir: &Path,
     message_id: i32,
     source: &ExternalSource,
@@ -341,6 +378,11 @@ fn build_external_target(
         ExternalSource::Magnet { info_hash, .. } => {
             let label = format!("torrent_{info_hash}");
             let target_path = download_dir.join("torrents").join(info_hash);
+            Ok((label, target_path, None))
+        }
+        ExternalSource::Mega { .. } => {
+            let label = format!("mega_{message_id}");
+            let target_path = download_dir.join("mega").join(&label);
             Ok((label, target_path, None))
         }
     }
@@ -416,6 +458,36 @@ pub fn choose_available_path(destination_dir: &Path, name: &OsStr) -> PathBuf {
     }
 }
 
+fn choose_available_path_ignoring(
+    destination_dir: &Path,
+    name: &OsStr,
+    ignored_existing_path: &Path,
+) -> PathBuf {
+    let candidate = destination_dir.join(name);
+    if candidate == ignored_existing_path || !candidate.exists() {
+        return candidate;
+    }
+
+    let path = Path::new(name);
+    let stem = path
+        .file_stem()
+        .map(|value| value.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "downloaded_file".to_string());
+    let suffix = path
+        .extension()
+        .map(|value| format!(".{}", value.to_string_lossy()))
+        .unwrap_or_default();
+
+    let mut counter = 1;
+    loop {
+        let numbered = destination_dir.join(format!("{stem}_{counter}{suffix}"));
+        if numbered == ignored_existing_path || !numbered.exists() {
+            return numbered;
+        }
+        counter += 1;
+    }
+}
+
 pub fn move_classified_target(
     config: &AppConfig,
     target: &ClassificationTarget,
@@ -426,7 +498,7 @@ pub fn move_classified_target(
     })
 }
 
-fn move_classified_target_with_operations<Mover>(
+pub fn move_classified_target_with_operations<Mover>(
     config: &AppConfig,
     target: &ClassificationTarget,
     kind: LibraryKind,
@@ -592,6 +664,24 @@ pub async fn download_with_resume(
     Ok(())
 }
 
+pub async fn download_external(
+    config: AppConfig,
+    source: ExternalSource,
+    target_path: &Path,
+    tracker: ProgressTracker,
+    cancellation: DownloadCancellation,
+) -> Result<PathBuf> {
+    match source {
+        ExternalSource::Mega { url } => {
+            download_external_with_megadl(config, url, target_path, tracker, cancellation).await
+        }
+        other => {
+            download_external_with_aria2(config, other, target_path, tracker, cancellation).await?;
+            Ok(target_path.to_path_buf())
+        }
+    }
+}
+
 pub async fn download_external_with_aria2(
     config: AppConfig,
     source: ExternalSource,
@@ -636,6 +726,7 @@ pub async fn download_external_with_aria2(
                 .arg(format!("--dir={}", target_path.display()))
                 .arg(uri);
         }
+        ExternalSource::Mega { .. } => unreachable!("MEGA downloads do not use aria2c"),
     }
 
     let mut child = command
@@ -712,9 +803,84 @@ pub async fn download_external_with_aria2(
                 );
             }
         }
+        ExternalSource::Mega { .. } => unreachable!("MEGA downloads do not use aria2c"),
     }
 
     Ok(())
+}
+
+async fn download_external_with_megadl(
+    config: AppConfig,
+    url: String,
+    target_path: &Path,
+    tracker: ProgressTracker,
+    cancellation: DownloadCancellation,
+) -> Result<PathBuf> {
+    if config.megadl_path.trim().is_empty() {
+        bail!("MEGADL_PATH cannot be empty");
+    }
+
+    if target_path.exists() {
+        let _ = tokio_fs::remove_dir_all(target_path).await;
+    }
+    tokio_fs::create_dir_all(target_path).await?;
+
+    let mut command = TokioCommand::new(&config.megadl_path);
+    command
+        .arg("--path")
+        .arg(target_path)
+        .arg(&url)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("failed to spawn {}", config.megadl_path))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("failed to capture megadl stdout"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow!("failed to capture megadl stderr"))?;
+
+    let stdout_task =
+        tokio::spawn(async move { collect_megadl_output(stdout, Some(tracker)).await });
+    let stderr_task = tokio::spawn(async move { collect_megadl_output(stderr, None).await });
+
+    let mut cancelled = false;
+    let exit_status = loop {
+        tokio::select! {
+            status = child.wait() => break status?,
+            _ = cancellation.cancelled(), if !cancelled => {
+                cancelled = true;
+                let _ = child.start_kill();
+            }
+        }
+    };
+
+    let stdout_capture = stdout_task.await??;
+    let stderr_capture = stderr_task.await??;
+    if cancelled {
+        cleanup_external_partial(&ExternalSource::Mega { url }, target_path).await?;
+        return Err(anyhow::Error::new(DownloadCancelled));
+    }
+    if !exit_status.success() {
+        let details = render_process_failure_details(&stdout_capture.tail, &stderr_capture.tail);
+        if details.is_empty() {
+            bail!("megadl exited with status {exit_status}");
+        }
+        bail!("megadl exited with status {exit_status}: {details}");
+    }
+    if !contains_payload_file(target_path)? {
+        bail!(
+            "megadl completed without downloaded payload files in {}",
+            target_path.display()
+        );
+    }
+
+    finalize_mega_target(target_path).await
 }
 
 async fn download_single_stream(
@@ -905,6 +1071,9 @@ async fn cleanup_external_partial(source: &ExternalSource, target_path: &Path) -
         ExternalSource::Magnet { .. } => {
             let _ = tokio_fs::remove_dir_all(target_path).await;
         }
+        ExternalSource::Mega { .. } => {
+            let _ = tokio_fs::remove_dir_all(target_path).await;
+        }
     }
     Ok(())
 }
@@ -966,6 +1135,7 @@ fn external_identity(source: &ExternalSource) -> String {
     match source {
         ExternalSource::DirectUrl { url } => format!("url:{url}"),
         ExternalSource::Magnet { info_hash, .. } => format!("magnet:{info_hash}"),
+        ExternalSource::Mega { url } => format!("mega:{url}"),
     }
 }
 
@@ -1019,7 +1189,7 @@ fn aligned_existing_size(path: &Path, chunk_size: usize) -> Result<u64> {
     Ok(aligned)
 }
 
-fn contains_payload_file(path: &Path) -> Result<bool> {
+pub fn contains_payload_file(path: &Path) -> Result<bool> {
     if path.is_file() {
         return Ok(!is_aria2_artifact(path));
     }
@@ -1040,7 +1210,7 @@ fn contains_payload_file(path: &Path) -> Result<bool> {
     Ok(false)
 }
 
-fn resolve_magnet_payload(container_dir: &Path) -> Result<ClassificationTarget> {
+pub fn resolve_magnet_payload(container_dir: &Path) -> Result<ClassificationTarget> {
     if !container_dir.is_dir() {
         bail!(
             "magnet download did not create a torrent directory at {}",
@@ -1067,6 +1237,31 @@ fn resolve_magnet_payload(container_dir: &Path) -> Result<ClassificationTarget> 
             "torrent payload is ambiguous in {}; expected exactly one top-level file or folder",
             container_dir.display()
         ),
+    }
+}
+
+pub fn resolve_mega_payload(container_dir: &Path) -> Result<ClassificationTarget> {
+    if !container_dir.is_dir() {
+        bail!(
+            "MEGA download did not create a wrapper directory at {}",
+            container_dir.display()
+        );
+    }
+
+    let entries = payload_entries(container_dir)?;
+    match entries.as_slice() {
+        [] => bail!(
+            "MEGA payload directory is empty: {}",
+            container_dir.display()
+        ),
+        [payload] => Ok(ClassificationTarget {
+            source_path: payload.clone(),
+            cleanup_dir: Some(container_dir.to_path_buf()),
+        }),
+        _ => Ok(ClassificationTarget {
+            source_path: container_dir.to_path_buf(),
+            cleanup_dir: None,
+        }),
     }
 }
 
@@ -1164,6 +1359,316 @@ async fn refresh_tracker_from_aria2(
     })
 }
 
+async fn collect_megadl_output<R>(
+    mut reader: R,
+    tracker: Option<ProgressTracker>,
+) -> Result<ProcessOutputCapture, std::io::Error>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut buffer = [0_u8; 4096];
+    let mut pending = Vec::new();
+    let mut tail = VecDeque::with_capacity(10);
+
+    loop {
+        let read = reader.read(&mut buffer).await?;
+        if read == 0 {
+            if !pending.is_empty() {
+                process_megadl_line(&pending, tracker.as_ref(), &mut tail).await;
+            }
+            break;
+        }
+
+        for byte in &buffer[..read] {
+            if matches!(*byte, b'\n' | b'\r') {
+                if !pending.is_empty() {
+                    process_megadl_line(&pending, tracker.as_ref(), &mut tail).await;
+                    pending.clear();
+                }
+            } else {
+                pending.push(*byte);
+            }
+        }
+    }
+
+    Ok(ProcessOutputCapture {
+        tail: tail.into_iter().collect(),
+    })
+}
+
+async fn process_megadl_line(
+    raw_line: &[u8],
+    tracker: Option<&ProgressTracker>,
+    tail: &mut VecDeque<String>,
+) {
+    let line = String::from_utf8_lossy(raw_line).trim().to_string();
+    if line.is_empty() {
+        return;
+    }
+    push_tail_line(tail, line.clone());
+
+    if let (Some(tracker), Some(snapshot)) = (tracker, parse_megadl_progress_line(&line)) {
+        let _ = tracker
+            .set_external_progress(
+                snapshot.current_item_label,
+                snapshot.downloaded_bytes,
+                snapshot.total_bytes,
+                snapshot.speed_mb_s,
+            )
+            .await;
+    }
+}
+
+fn push_tail_line(tail: &mut VecDeque<String>, line: String) {
+    if tail.len() == 10 {
+        tail.pop_front();
+    }
+    tail.push_back(line);
+}
+
+fn render_process_failure_details(stdout_tail: &[String], stderr_tail: &[String]) -> String {
+    let stderr_text = stderr_tail.join(" | ");
+    if !stderr_text.is_empty() {
+        return stderr_text;
+    }
+
+    stdout_tail.join(" | ")
+}
+
+pub fn parse_megadl_progress_line(line: &str) -> Option<MegaProgressSnapshot> {
+    let captures = MEGA_PROGRESS_RE.captures(line)?;
+    let downloaded_bytes = parse_decimal_bytes(captures.name("downloaded_bytes")?.as_str())?;
+    let total_bytes = parse_human_size(captures.name("human_total")?.as_str());
+    let speed_mb_s = parse_speed_to_mb_s(captures.name("speed")?.as_str());
+
+    Some(MegaProgressSnapshot {
+        current_item_label: captures.name("name")?.as_str().trim().to_string(),
+        downloaded_bytes,
+        total_bytes,
+        speed_mb_s,
+    })
+}
+
+fn parse_decimal_bytes(input: &str) -> Option<u64> {
+    let digits = input
+        .chars()
+        .filter(|ch| ch.is_ascii_digit())
+        .collect::<String>();
+    digits.parse().ok()
+}
+
+pub fn parse_human_size(input: &str) -> Option<u64> {
+    let normalized_input = input.replace(['\u{a0}', '\u{202f}'], " ");
+    let normalized = normalized_input.split_whitespace().collect::<Vec<_>>();
+    let [value, unit] = normalized.as_slice() else {
+        return None;
+    };
+
+    let value = value.replace(',', "");
+    let numeric = value.parse::<f64>().ok()?;
+    let multiplier = match unit.to_ascii_lowercase().as_str() {
+        "b" => 1_f64,
+        "kib" => 1024_f64,
+        "mib" => 1024_f64.powi(2),
+        "gib" => 1024_f64.powi(3),
+        "tib" => 1024_f64.powi(4),
+        "kb" => 1000_f64,
+        "mb" => 1000_f64.powi(2),
+        "gb" => 1000_f64.powi(3),
+        "tb" => 1000_f64.powi(4),
+        _ => return None,
+    };
+
+    Some((numeric * multiplier).round() as u64)
+}
+
+fn parse_speed_to_mb_s(input: &str) -> Option<f64> {
+    parse_human_size(input).map(|bytes| bytes as f64 / (1024.0 * 1024.0))
+}
+
+pub async fn finalize_mega_target(target_path: &Path) -> Result<PathBuf> {
+    let entries = payload_entries(target_path)?;
+    if let [payload] = entries.as_slice() {
+        if payload.is_dir() {
+            return collapse_single_nested_mega_directory(target_path, payload).await;
+        }
+    }
+
+    let parent = target_path
+        .parent()
+        .ok_or_else(|| anyhow!("MEGA target path has no parent: {}", target_path.display()))?;
+    let fallback_name = target_path.file_name().ok_or_else(|| {
+        anyhow!(
+            "MEGA target path has no filename: {}",
+            target_path.display()
+        )
+    })?;
+    let inferred_name = infer_mega_wrapper_name(target_path)
+        .unwrap_or_else(|| fallback_name.to_string_lossy().into_owned());
+    let sanitized = sanitize_filename(&inferred_name);
+    let destination = choose_available_path(parent, OsStr::new(&sanitized));
+    if destination == target_path {
+        return Ok(target_path.to_path_buf());
+    }
+    tokio_fs::rename(target_path, &destination)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to rename MEGA download directory {} to {}",
+                target_path.display(),
+                destination.display()
+            )
+        })?;
+    Ok(destination)
+}
+
+async fn collapse_single_nested_mega_directory(
+    target_path: &Path,
+    payload_dir: &Path,
+) -> Result<PathBuf> {
+    let parent = target_path
+        .parent()
+        .ok_or_else(|| anyhow!("MEGA target path has no parent: {}", target_path.display()))?;
+    let desired_name = payload_dir
+        .file_name()
+        .map(|value| sanitize_filename(&value.to_string_lossy()))
+        .unwrap_or_else(|| {
+            target_path
+                .file_name()
+                .map(|value| value.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "mega_download".to_string())
+        });
+    let current_name = target_path
+        .file_name()
+        .map(|value| value.to_string_lossy().into_owned())
+        .unwrap_or_default();
+
+    if desired_name == current_name {
+        move_directory_contents(payload_dir, target_path).await?;
+        tokio_fs::remove_dir(payload_dir).await.with_context(|| {
+            format!(
+                "failed to remove collapsed MEGA wrapper directory {}",
+                payload_dir.display()
+            )
+        })?;
+        return Ok(target_path.to_path_buf());
+    }
+
+    let destination =
+        choose_available_path_ignoring(parent, OsStr::new(&desired_name), target_path);
+    tokio_fs::rename(payload_dir, &destination)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to move nested MEGA payload {} to {}",
+                payload_dir.display(),
+                destination.display()
+            )
+        })?;
+    tokio_fs::remove_dir(target_path).await.with_context(|| {
+        format!(
+            "failed to remove empty MEGA wrapper directory {}",
+            target_path.display()
+        )
+    })?;
+    Ok(destination)
+}
+
+async fn move_directory_contents(source_dir: &Path, destination_dir: &Path) -> Result<()> {
+    let mut entries = tokio_fs::read_dir(source_dir).await?;
+    while let Some(entry) = entries.next_entry().await? {
+        let source_path = entry.path();
+        let destination_path = destination_dir.join(entry.file_name());
+        tokio_fs::rename(&source_path, &destination_path)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to move {} into {}",
+                    source_path.display(),
+                    destination_dir.display()
+                )
+            })?;
+    }
+    Ok(())
+}
+
+pub fn infer_mega_wrapper_name(target_path: &Path) -> Option<String> {
+    let entries = payload_entries(target_path).ok()?;
+    match entries.as_slice() {
+        [payload] if payload.is_file() => payload
+            .file_stem()
+            .map(|value| sanitize_filename(&value.to_string_lossy())),
+        [payload] if payload.is_dir() => payload
+            .file_name()
+            .map(|value| sanitize_filename(&value.to_string_lossy())),
+        _ => infer_common_payload_root(target_path),
+    }
+}
+
+fn payload_entries(target_path: &Path) -> Result<Vec<PathBuf>> {
+    let mut entries = fs::read_dir(target_path)?
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| !is_aria2_artifact(path))
+        .collect::<Vec<_>>();
+    entries.sort();
+    Ok(entries)
+}
+
+pub fn infer_common_payload_root(target_path: &Path) -> Option<String> {
+    let mut common_root: Option<String> = None;
+    let mut saw_payload = false;
+    collect_payload_files(target_path)
+        .ok()?
+        .into_iter()
+        .try_for_each(|path| {
+            let relative = path.strip_prefix(target_path).ok()?;
+            let root = relative
+                .components()
+                .find_map(|component| match component {
+                    Component::Normal(value) => Some(value.to_string_lossy().into_owned()),
+                    _ => None,
+                })?;
+            saw_payload = true;
+            match &common_root {
+                Some(existing) if existing != &root => None,
+                Some(_) => Some(()),
+                None => {
+                    common_root = Some(root);
+                    Some(())
+                }
+            }
+        })?;
+
+    if saw_payload {
+        common_root.map(|value| sanitize_filename(&value))
+    } else {
+        None
+    }
+}
+
+fn collect_payload_files(root: &Path) -> Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    collect_payload_files_inner(root, &mut files)?;
+    Ok(files)
+}
+
+fn collect_payload_files_inner(root: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        let path = entry.path();
+        if is_aria2_artifact(&path) {
+            continue;
+        }
+        if entry.file_type()?.is_dir() {
+            collect_payload_files_inner(&path, files)?;
+        } else {
+            files.push(path);
+        }
+    }
+    Ok(())
+}
+
 async fn rpc_call<T: for<'de> Deserialize<'de>>(
     http: &HttpClient,
     rpc_url: &str,
@@ -1191,462 +1696,4 @@ async fn rpc_call<T: for<'de> Deserialize<'de>>(
 
     let payload = response.json::<AriaRpcResponse<T>>().await?;
     Ok(payload.result)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{
-        build_external_target, choose_available_path, contains_payload_file, extract_external_link,
-        move_classified_target, move_classified_target_with_operations, resolve_magnet_payload,
-        ActiveDownloadKey, ClassificationTarget, ExternalSource, LibraryKind,
-    };
-    use crate::config::AppConfig;
-    use anyhow::bail;
-    use std::ffi::OsStr;
-    use std::fs;
-    use std::path::{Path, PathBuf};
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    #[test]
-    fn extracts_direct_http_link() {
-        let source = extract_external_link("download https://example.com/files/archive.zip")
-            .expect("http link should be found");
-        assert_eq!(
-            source,
-            ExternalSource::DirectUrl {
-                url: "https://example.com/files/archive.zip".to_string()
-            }
-        );
-    }
-
-    #[test]
-    fn extracts_https_link_with_query() {
-        let source = extract_external_link("mirror: https://example.com/file.iso?token=abc123")
-            .expect("https link should be found");
-        assert_eq!(
-            source,
-            ExternalSource::DirectUrl {
-                url: "https://example.com/file.iso?token=abc123".to_string()
-            }
-        );
-    }
-
-    #[test]
-    fn prefers_magnet_over_direct_link() {
-        let source = extract_external_link(
-            "http://example.com/file.iso magnet:?xt=urn:btih:ABCDEF1234567890&dn=test",
-        )
-        .expect("magnet should be found");
-        assert_eq!(
-            source,
-            ExternalSource::Magnet {
-                uri: "magnet:?xt=urn:btih:ABCDEF1234567890&dn=test".to_string(),
-                info_hash: "abcdef1234567890".to_string(),
-            }
-        );
-    }
-
-    #[test]
-    fn returns_none_when_no_supported_link_exists() {
-        assert!(extract_external_link("nothing to download here").is_none());
-    }
-
-    #[test]
-    fn builds_direct_target_from_url_filename() {
-        let base = unique_test_dir("direct-target");
-        fs::create_dir_all(&base).expect("test dir should be created");
-        let (label, target, expected_size) = build_external_target(
-            &base,
-            42,
-            &ExternalSource::DirectUrl {
-                url: "https://example.com/release.tar.gz".to_string(),
-            },
-        )
-        .expect("target should build");
-        assert_eq!(label, "release.tar.gz");
-        assert_eq!(target, base.join("release.tar.gz"));
-        assert_eq!(expected_size, None);
-        let _ = fs::remove_dir_all(&base);
-    }
-
-    #[test]
-    fn falls_back_to_message_id_when_url_has_no_filename() {
-        let base = unique_test_dir("direct-fallback");
-        fs::create_dir_all(&base).expect("test dir should be created");
-        let (label, target, _) = build_external_target(
-            &base,
-            99,
-            &ExternalSource::DirectUrl {
-                url: "https://example.com/downloads/".to_string(),
-            },
-        )
-        .expect("fallback target should build");
-        assert_eq!(label, "download_99");
-        assert_eq!(target, base.join("download_99"));
-        let _ = fs::remove_dir_all(&base);
-    }
-
-    #[test]
-    fn builds_magnet_directory_from_info_hash() {
-        let base = PathBuf::from("/tmp/test-downloads");
-        let (label, target, expected_size) = build_external_target(
-            &base,
-            1,
-            &ExternalSource::Magnet {
-                uri: "magnet:?xt=urn:btih:001122".to_string(),
-                info_hash: "001122".to_string(),
-            },
-        )
-        .expect("magnet target should build");
-        assert_eq!(label, "torrent_001122");
-        assert_eq!(target, base.join("torrents").join("001122"));
-        assert_eq!(expected_size, None);
-    }
-
-    #[test]
-    fn active_keys_cover_telegram_and_external_downloads() {
-        let telegram = ActiveDownloadKey::Telegram {
-            path: PathBuf::from("/tmp/photo.jpg"),
-            size: Some(10),
-        };
-        let direct = ActiveDownloadKey::External {
-            identity: "url:https://example.com/file.bin".to_string(),
-        };
-        let magnet = ActiveDownloadKey::External {
-            identity: "magnet:001122".to_string(),
-        };
-
-        assert_eq!(
-            telegram,
-            ActiveDownloadKey::Telegram {
-                path: PathBuf::from("/tmp/photo.jpg"),
-                size: Some(10),
-            }
-        );
-        assert_eq!(
-            direct,
-            ActiveDownloadKey::External {
-                identity: "url:https://example.com/file.bin".to_string(),
-            }
-        );
-        assert_eq!(
-            magnet,
-            ActiveDownloadKey::External {
-                identity: "magnet:001122".to_string(),
-            }
-        );
-    }
-
-    #[test]
-    fn payload_detection_ignores_aria2_artifacts() {
-        let base = unique_test_dir("payload-check");
-        fs::create_dir_all(&base).expect("test dir should be created");
-        fs::write(base.join("partial.iso.aria2"), b"state").expect("artifact should be written");
-        assert!(!contains_payload_file(&base).expect("artifact-only dir should be empty"));
-
-        fs::write(base.join("real.iso"), b"payload").expect("payload should be written");
-        assert!(contains_payload_file(&base).expect("payload should be detected"));
-        let _ = fs::remove_dir_all(&base);
-    }
-
-    #[test]
-    fn resolve_magnet_payload_returns_single_file() {
-        let base = unique_test_dir("magnet-payload-file");
-        let container = base.join("hash");
-        fs::create_dir_all(&container).expect("container should exist");
-        let payload = container.join("episode.mkv");
-        fs::write(&payload, b"payload").expect("payload should be written");
-
-        let target = resolve_magnet_payload(&container).expect("payload should resolve");
-        assert_eq!(
-            target,
-            ClassificationTarget {
-                source_path: payload,
-                cleanup_dir: Some(container),
-            }
-        );
-        let _ = fs::remove_dir_all(&base);
-    }
-
-    #[test]
-    fn resolve_magnet_payload_returns_single_directory() {
-        let base = unique_test_dir("magnet-payload-dir");
-        let container = base.join("hash");
-        let payload = container.join("Season 1");
-        fs::create_dir_all(&payload).expect("payload dir should exist");
-
-        let target = resolve_magnet_payload(&container).expect("payload should resolve");
-        assert_eq!(target.source_path, payload);
-        assert_eq!(target.cleanup_dir, Some(container));
-        let _ = fs::remove_dir_all(&base);
-    }
-
-    #[test]
-    fn resolve_magnet_payload_rejects_empty_directory() {
-        let base = unique_test_dir("magnet-empty");
-        let container = base.join("hash");
-        fs::create_dir_all(&container).expect("container should exist");
-
-        let error = resolve_magnet_payload(&container).expect_err("empty container should fail");
-        assert!(error.to_string().contains("empty"));
-        let _ = fs::remove_dir_all(&base);
-    }
-
-    #[test]
-    fn resolve_magnet_payload_rejects_multiple_top_level_entries() {
-        let base = unique_test_dir("magnet-many");
-        let container = base.join("hash");
-        fs::create_dir_all(&container).expect("container should exist");
-        fs::write(container.join("a.mkv"), b"a").expect("first payload should be written");
-        fs::write(container.join("b.mkv"), b"b").expect("second payload should be written");
-
-        let error =
-            resolve_magnet_payload(&container).expect_err("multi-entry container should fail");
-        assert!(error.to_string().contains("ambiguous"));
-        let _ = fs::remove_dir_all(&base);
-    }
-
-    #[test]
-    fn choose_available_path_adds_numeric_suffix() {
-        let base = unique_test_dir("available-path");
-        fs::create_dir_all(&base).expect("base should exist");
-        fs::write(base.join("movie.mkv"), b"payload").expect("existing file should be written");
-
-        let chosen = choose_available_path(&base, OsStr::new("movie.mkv"));
-        assert_eq!(chosen, base.join("movie_1.mkv"));
-        let _ = fs::remove_dir_all(&base);
-    }
-
-    #[test]
-    fn move_classified_target_moves_file_to_movie_dir() {
-        let base = unique_test_dir("move-file");
-        let config = test_config(&base);
-        fs::create_dir_all(&config.movie_dir).expect("movie dir should exist");
-        fs::create_dir_all(&config.tv_show_dir).expect("tv dir should exist");
-        fs::create_dir_all(&config.anime_dir).expect("anime dir should exist");
-        let source = base.join("downloads").join("movie.mkv");
-        fs::create_dir_all(source.parent().unwrap()).expect("downloads dir should exist");
-        fs::write(&source, b"payload").expect("source should exist");
-
-        let destination = move_classified_target(
-            &config,
-            &ClassificationTarget {
-                source_path: source.clone(),
-                cleanup_dir: None,
-            },
-            LibraryKind::Movie,
-        )
-        .expect("move should succeed");
-
-        assert_eq!(destination, config.movie_dir.join("movie.mkv"));
-        assert!(destination.exists());
-        assert!(!source.exists());
-        let _ = fs::remove_dir_all(&base);
-    }
-
-    #[test]
-    fn move_classified_target_removes_empty_magnet_container() {
-        let base = unique_test_dir("move-magnet");
-        let config = test_config(&base);
-        fs::create_dir_all(&config.movie_dir).expect("movie dir should exist");
-        fs::create_dir_all(&config.tv_show_dir).expect("tv dir should exist");
-        fs::create_dir_all(&config.anime_dir).expect("anime dir should exist");
-        let container = base.join("downloads").join("torrents").join("abc");
-        fs::create_dir_all(&container).expect("container should exist");
-        let source = container.join("Show");
-        fs::create_dir_all(&source).expect("payload dir should exist");
-
-        let destination = move_classified_target(
-            &config,
-            &ClassificationTarget {
-                source_path: source.clone(),
-                cleanup_dir: Some(container.clone()),
-            },
-            LibraryKind::TvShow,
-        )
-        .expect("move should succeed");
-
-        assert_eq!(destination, config.tv_show_dir.join("Show"));
-        assert!(destination.exists());
-        assert!(!container.exists());
-        let _ = fs::remove_dir_all(&base);
-    }
-
-    #[test]
-    fn move_classified_target_avoids_overwrite() {
-        let base = unique_test_dir("move-collision");
-        let config = test_config(&base);
-        fs::create_dir_all(&config.movie_dir).expect("movie dir should exist");
-        fs::create_dir_all(&config.tv_show_dir).expect("tv dir should exist");
-        fs::create_dir_all(&config.anime_dir).expect("anime dir should exist");
-        fs::write(config.movie_dir.join("movie.mkv"), b"existing").expect("existing file");
-        let source = base.join("downloads").join("movie.mkv");
-        fs::create_dir_all(source.parent().unwrap()).expect("downloads dir should exist");
-        fs::write(&source, b"payload").expect("source should exist");
-
-        let destination = move_classified_target(
-            &config,
-            &ClassificationTarget {
-                source_path: source,
-                cleanup_dir: None,
-            },
-            LibraryKind::Movie,
-        )
-        .expect("move should succeed");
-
-        assert_eq!(destination, config.movie_dir.join("movie_1.mkv"));
-        let _ = fs::remove_dir_all(&base);
-    }
-
-    #[test]
-    fn move_classified_target_moves_directory_to_anime_dir() {
-        let base = unique_test_dir("move-anime");
-        let config = test_config(&base);
-        fs::create_dir_all(&config.movie_dir).expect("movie dir should exist");
-        fs::create_dir_all(&config.tv_show_dir).expect("tv dir should exist");
-        fs::create_dir_all(&config.anime_dir).expect("anime dir should exist");
-        let source = base.join("downloads").join("Anime Series");
-        fs::create_dir_all(&source).expect("anime source should exist");
-
-        let destination = move_classified_target(
-            &config,
-            &ClassificationTarget {
-                source_path: source.clone(),
-                cleanup_dir: None,
-            },
-            LibraryKind::Anime,
-        )
-        .expect("move should succeed");
-
-        assert_eq!(destination, config.anime_dir.join("Anime Series"));
-        assert!(destination.exists());
-        assert!(!source.exists());
-        let _ = fs::remove_dir_all(&base);
-    }
-
-    #[test]
-    fn move_classified_target_uses_external_mover_for_successful_transfer() {
-        let base = unique_test_dir("move-rsync-success");
-        let config = test_config(&base);
-        fs::create_dir_all(&config.movie_dir).expect("movie dir should exist");
-        fs::create_dir_all(&config.tv_show_dir).expect("tv dir should exist");
-        fs::create_dir_all(&config.anime_dir).expect("anime dir should exist");
-        let container = base.join("downloads").join("torrents").join("abc");
-        fs::create_dir_all(&container).expect("container should exist");
-        let source = container.join("Show");
-        fs::create_dir_all(&source).expect("payload dir should exist");
-        fs::write(source.join("episode.mkv"), b"payload").expect("payload file should exist");
-
-        let destination = move_classified_target_with_operations(
-            &config,
-            &ClassificationTarget {
-                source_path: source.clone(),
-                cleanup_dir: Some(container.clone()),
-            },
-            LibraryKind::Movie,
-            &|source, destination| {
-                copy_dir(source, destination)?;
-                remove_source_files(source)?;
-                Ok(())
-            },
-        )
-        .expect("rsync-style move should succeed");
-
-        assert_eq!(destination, config.movie_dir.join("Show"));
-        assert!(destination.join("episode.mkv").exists());
-        assert!(!source.exists());
-        assert!(!container.exists());
-        let _ = fs::remove_dir_all(&base);
-    }
-
-    #[test]
-    fn move_classified_target_keeps_cleanup_dir_when_external_mover_fails() {
-        let base = unique_test_dir("move-rsync-failure");
-        let config = test_config(&base);
-        fs::create_dir_all(&config.movie_dir).expect("movie dir should exist");
-        fs::create_dir_all(&config.tv_show_dir).expect("tv dir should exist");
-        fs::create_dir_all(&config.anime_dir).expect("anime dir should exist");
-        let container = base.join("downloads").join("torrents").join("abc");
-        fs::create_dir_all(&container).expect("container should exist");
-        let source = container.join("Show");
-        fs::create_dir_all(&source).expect("payload dir should exist");
-
-        let error = move_classified_target_with_operations(
-            &config,
-            &ClassificationTarget {
-                source_path: source.clone(),
-                cleanup_dir: Some(container.clone()),
-            },
-            LibraryKind::Movie,
-            &|_, _| bail!("rsync exited with status 23: permission denied"),
-        )
-        .expect_err("external mover should fail");
-
-        let rendered = format!("{error:#}");
-        assert!(rendered.contains("failed to move"));
-        assert!(rendered.contains("permission denied"));
-        assert!(source.exists());
-        assert!(container.exists());
-        let _ = fs::remove_dir_all(&base);
-    }
-
-    fn unique_test_dir(prefix: &str) -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock should be monotonic enough for tests")
-            .as_nanos();
-        std::env::temp_dir().join(format!("telegram_downloader_{prefix}_{nanos}"))
-    }
-
-    fn test_config(base: &Path) -> AppConfig {
-        AppConfig {
-            api_id: 1,
-            api_hash: "hash".to_string(),
-            bot_token: "token".to_string(),
-            session_path: base.join("session"),
-            download_dir: base.join("downloads"),
-            movie_dir: base.join("movies"),
-            tv_show_dir: base.join("shows"),
-            anime_dir: base.join("anime"),
-            max_concurrent_downloads: 1,
-            parallel_chunk_downloads: 1,
-            chunk_size: 512 * 1024,
-            aria2c_path: "aria2c".to_string(),
-            aria2c_poll_interval_ms: 1000,
-            reply_on_duplicate: true,
-        }
-    }
-
-    fn copy_dir(source: &Path, destination: &Path) -> Result<(), std::io::Error> {
-        fs::create_dir_all(destination)?;
-        for entry in fs::read_dir(source)? {
-            let entry = entry?;
-            let entry_path = entry.path();
-            let destination_path = destination.join(entry.file_name());
-            if entry.file_type()?.is_dir() {
-                copy_dir(&entry_path, &destination_path)?;
-            } else {
-                fs::copy(&entry_path, &destination_path)?;
-            }
-        }
-        Ok(())
-    }
-
-    fn remove_source_files(path: &Path) -> Result<(), std::io::Error> {
-        if !path.is_dir() {
-            return Ok(());
-        }
-
-        for entry in fs::read_dir(path)? {
-            let entry = entry?;
-            let entry_path = entry.path();
-            if entry.file_type()?.is_dir() {
-                remove_source_files(&entry_path)?;
-            } else {
-                fs::remove_file(&entry_path)?;
-            }
-        }
-
-        Ok(())
-    }
 }

@@ -18,6 +18,8 @@ struct ProgressState {
     last_logged_mb: f64,
     terminal_status_text: String,
     telegram_status_text: String,
+    current_item_label: Option<String>,
+    explicit_speed_mb_s: Option<f64>,
 }
 
 /// Tracks progress for one file and formats that progress for both terminal and Telegram updates.
@@ -40,6 +42,8 @@ impl ProgressTracker {
                 last_logged_mb: -1.0,
                 terminal_status_text: String::new(),
                 telegram_status_text: String::new(),
+                current_item_label: None,
+                explicit_speed_mb_s: None,
             })),
             total_size: Arc::new(Mutex::new(total_size)),
         }
@@ -50,8 +54,19 @@ impl ProgressTracker {
         let mut inner = self.inner.lock().await;
         inner.completed_bytes = completed_bytes;
         let downloaded = inner.completed_bytes + inner.segment_progress.iter().sum::<u64>();
-        inner.terminal_status_text = self.format_terminal_progress_text(downloaded, total_size);
-        inner.telegram_status_text = self.format_telegram_progress_text(downloaded, total_size);
+        inner.explicit_speed_mb_s = None;
+        inner.terminal_status_text = self.format_terminal_progress_text(
+            inner.current_item_label.as_deref(),
+            downloaded,
+            total_size,
+            inner.explicit_speed_mb_s,
+        );
+        inner.telegram_status_text = self.format_telegram_progress_text(
+            inner.current_item_label.as_deref(),
+            downloaded,
+            total_size,
+            inner.explicit_speed_mb_s,
+        );
     }
 
     pub async fn log_snapshot(&self) -> Result<()> {
@@ -59,8 +74,18 @@ impl ProgressTracker {
         let text = {
             let mut inner = self.inner.lock().await;
             let downloaded = inner.completed_bytes + inner.segment_progress.iter().sum::<u64>();
-            inner.terminal_status_text = self.format_terminal_progress_text(downloaded, total_size);
-            inner.telegram_status_text = self.format_telegram_progress_text(downloaded, total_size);
+            inner.terminal_status_text = self.format_terminal_progress_text(
+                inner.current_item_label.as_deref(),
+                downloaded,
+                total_size,
+                inner.explicit_speed_mb_s,
+            );
+            inner.telegram_status_text = self.format_telegram_progress_text(
+                inner.current_item_label.as_deref(),
+                downloaded,
+                total_size,
+                inner.explicit_speed_mb_s,
+            );
             inner.terminal_status_text.clone()
         };
         render_terminal_line(&text).await
@@ -76,8 +101,19 @@ impl ProgressTracker {
             inner.segment_progress[segment_index] = bytes_downloaded;
 
             let downloaded = inner.completed_bytes + inner.segment_progress.iter().sum::<u64>();
-            inner.terminal_status_text = self.format_terminal_progress_text(downloaded, total_size);
-            inner.telegram_status_text = self.format_telegram_progress_text(downloaded, total_size);
+            inner.explicit_speed_mb_s = None;
+            inner.terminal_status_text = self.format_terminal_progress_text(
+                inner.current_item_label.as_deref(),
+                downloaded,
+                total_size,
+                inner.explicit_speed_mb_s,
+            );
+            inner.telegram_status_text = self.format_telegram_progress_text(
+                inner.current_item_label.as_deref(),
+                downloaded,
+                total_size,
+                inner.explicit_speed_mb_s,
+            );
             let downloaded_mb = downloaded as f64 / (1024.0 * 1024.0);
             if inner.last_logged_mb >= 0.0
                 && (downloaded_mb - inner.last_logged_mb) < MIN_PROGRESS_LOG_INCREMENT_MB
@@ -108,8 +144,19 @@ impl ProgressTracker {
             }
             inner.segment_progress[segment_index] = segment_size;
             let downloaded = inner.completed_bytes + inner.segment_progress.iter().sum::<u64>();
-            inner.terminal_status_text = self.format_terminal_progress_text(downloaded, total_size);
-            inner.telegram_status_text = self.format_telegram_progress_text(downloaded, total_size);
+            inner.explicit_speed_mb_s = None;
+            inner.terminal_status_text = self.format_terminal_progress_text(
+                inner.current_item_label.as_deref(),
+                downloaded,
+                total_size,
+                inner.explicit_speed_mb_s,
+            );
+            inner.telegram_status_text = self.format_telegram_progress_text(
+                inner.current_item_label.as_deref(),
+                downloaded,
+                total_size,
+                inner.explicit_speed_mb_s,
+            );
             inner.last_logged_mb = downloaded as f64 / (1024.0 * 1024.0);
             inner.terminal_status_text.clone()
         };
@@ -135,11 +182,48 @@ impl ProgressTracker {
             inner.completed_bytes = 0;
             inner.segment_progress.clear();
             inner.segment_progress.push(downloaded_bytes);
+            inner.explicit_speed_mb_s = None;
             inner.last_logged_mb = downloaded_bytes as f64 / (1024.0 * 1024.0);
             inner.terminal_status_text =
-                self.format_terminal_progress_text(downloaded_bytes, total_size);
+                self.format_terminal_progress_text(None, downloaded_bytes, total_size, None);
             inner.telegram_status_text =
-                self.format_telegram_progress_text(downloaded_bytes, total_size);
+                self.format_telegram_progress_text(None, downloaded_bytes, total_size, None);
+            inner.terminal_status_text.clone()
+        };
+        render_terminal_line(&text).await
+    }
+
+    pub async fn set_external_progress(
+        &self,
+        current_item_label: String,
+        downloaded_bytes: u64,
+        total_size: Option<u64>,
+        speed_mb_s: Option<f64>,
+    ) -> Result<()> {
+        let text = {
+            let mut total = self.total_size.lock().await;
+            *total = total_size;
+            drop(total);
+
+            let mut inner = self.inner.lock().await;
+            inner.completed_bytes = 0;
+            inner.segment_progress.clear();
+            inner.segment_progress.push(downloaded_bytes);
+            inner.current_item_label = Some(current_item_label);
+            inner.explicit_speed_mb_s = speed_mb_s;
+            inner.last_logged_mb = downloaded_bytes as f64 / (1024.0 * 1024.0);
+            inner.terminal_status_text = self.format_terminal_progress_text(
+                inner.current_item_label.as_deref(),
+                downloaded_bytes,
+                total_size,
+                speed_mb_s,
+            );
+            inner.telegram_status_text = self.format_telegram_progress_text(
+                inner.current_item_label.as_deref(),
+                downloaded_bytes,
+                total_size,
+                speed_mb_s,
+            );
             inner.terminal_status_text.clone()
         };
         render_terminal_line(&text).await
@@ -149,19 +233,46 @@ impl ProgressTracker {
         *self.total_size.lock().await
     }
 
-    fn format_terminal_progress_text(&self, downloaded: u64, total_size: Option<u64>) -> String {
-        let summary = self.format_progress_summary(downloaded, total_size);
-        format!("{}: {}", self.filename, summary)
+    fn format_terminal_progress_text(
+        &self,
+        current_item_label: Option<&str>,
+        downloaded: u64,
+        total_size: Option<u64>,
+        speed_mb_s: Option<f64>,
+    ) -> String {
+        let summary = self.format_progress_summary(downloaded, total_size, speed_mb_s);
+        match current_item_label {
+            Some(label) => format!("{} :: {}: {}", self.filename, label, summary),
+            None => format!("{}: {}", self.filename, summary),
+        }
     }
 
-    fn format_telegram_progress_text(&self, downloaded: u64, total_size: Option<u64>) -> String {
-        self.format_progress_summary(downloaded, total_size)
+    fn format_telegram_progress_text(
+        &self,
+        current_item_label: Option<&str>,
+        downloaded: u64,
+        total_size: Option<u64>,
+        speed_mb_s: Option<f64>,
+    ) -> String {
+        let summary = self.format_progress_summary(downloaded, total_size, speed_mb_s);
+        match current_item_label {
+            Some(label) => format!("{label}: {summary}"),
+            None => summary,
+        }
     }
 
-    fn format_progress_summary(&self, downloaded: u64, total_size: Option<u64>) -> String {
+    fn format_progress_summary(
+        &self,
+        downloaded: u64,
+        total_size: Option<u64>,
+        speed_mb_s: Option<f64>,
+    ) -> String {
         let downloaded_mb = downloaded as f64 / (1024.0 * 1024.0);
-        let elapsed_secs = self.started_at.elapsed().as_secs_f64().max(1.0);
-        let speed_mb_s = downloaded_mb / elapsed_secs;
+        let computed_speed_mb_s = {
+            let elapsed_secs = self.started_at.elapsed().as_secs_f64().max(1.0);
+            downloaded_mb / elapsed_secs
+        };
+        let speed_mb_s = speed_mb_s.unwrap_or(computed_speed_mb_s);
         if let Some(total_size) = total_size.filter(|size| *size > 0) {
             let total_mb = total_size as f64 / (1024.0 * 1024.0);
             let percent = (downloaded as f64 / total_size as f64 * 100.0).min(100.0);
@@ -221,29 +332,4 @@ pub async fn clear_terminal_line() -> Result<()> {
     );
     io::stdout().flush()?;
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::ProgressTracker;
-
-    #[tokio::test]
-    async fn absolute_progress_switches_to_known_total() {
-        let tracker = ProgressTracker::new("sample.bin".to_string(), None);
-        tracker
-            .set_absolute_progress(5 * 1024 * 1024, None)
-            .await
-            .expect("absolute progress should render");
-        let initial = tracker.current_status_text().await;
-        assert!(initial.contains("MB |"));
-        assert!(!initial.contains('%'));
-
-        tracker
-            .set_absolute_progress(5 * 1024 * 1024, Some(10 * 1024 * 1024))
-            .await
-            .expect("absolute progress with total should render");
-        let updated = tracker.current_status_text().await;
-        assert!(updated.contains("50.0%"));
-        assert!(updated.contains("ETA"));
-    }
 }

@@ -1,12 +1,7 @@
-mod app;
-mod config;
-mod download;
-mod progress;
-
 use anyhow::{Context, Result};
-use app::run_app;
-use config::{configure_logging, load_runtime_env, AppConfig};
 use std::env;
+use telegram_downloader_rust::app::run_app;
+use telegram_downloader_rust::config::{configure_logging, load_runtime_env, AppConfig};
 
 #[tokio::main]
 async fn main() -> Result<()> {
