@@ -378,25 +378,19 @@ pub fn move_classified_target(
     target: &ClassificationTarget,
     kind: LibraryKind,
 ) -> Result<PathBuf> {
-    move_classified_target_with_operations(
-        config,
-        target,
-        kind,
-        &|source, destination| fs::rename(source, destination),
-        &|source, destination| move_with_mv(source, destination),
-    )
+    move_classified_target_with_operations(config, target, kind, &|source, destination| {
+        move_with_rsync(source, destination)
+    })
 }
 
-fn move_classified_target_with_operations<Rename, MoveWithMv>(
+fn move_classified_target_with_operations<Mover>(
     config: &AppConfig,
     target: &ClassificationTarget,
     kind: LibraryKind,
-    rename: &Rename,
-    move_with_mv: &MoveWithMv,
+    mover: &Mover,
 ) -> Result<PathBuf>
 where
-    Rename: Fn(&Path, &Path) -> std::io::Result<()>,
-    MoveWithMv: Fn(&Path, &Path) -> Result<()>,
+    Mover: Fn(&Path, &Path) -> Result<()>,
 {
     let destination_dir = match kind {
         LibraryKind::Movie => &config.movie_dir,
@@ -410,7 +404,14 @@ where
         )
     })?;
     let destination_path = choose_available_path(destination_dir, file_name);
-    move_path_with_fallback(&target.source_path, &destination_path, rename, move_with_mv)?;
+    mover(&target.source_path, &destination_path).with_context(|| {
+        format!(
+            "failed to move {} to {}",
+            target.source_path.display(),
+            destination_path.display()
+        )
+    })?;
+    remove_residual_source_path(&target.source_path)?;
 
     if let Some(cleanup_dir) = &target.cleanup_dir {
         remove_empty_directory(cleanup_dir)?;
@@ -419,47 +420,17 @@ where
     Ok(destination_path)
 }
 
-fn move_path_with_fallback<Rename, MoveWithMv>(
-    source_path: &Path,
-    destination_path: &Path,
-    rename: &Rename,
-    move_with_mv: &MoveWithMv,
-) -> Result<()>
-where
-    Rename: Fn(&Path, &Path) -> std::io::Result<()>,
-    MoveWithMv: Fn(&Path, &Path) -> Result<()>,
-{
-    match rename(source_path, destination_path) {
-        Ok(()) => Ok(()),
-        Err(err) if is_cross_device_link_error(&err) => move_with_mv(source_path, destination_path)
-            .with_context(|| {
-                format!(
-                    "failed to move {} to {}",
-                    source_path.display(),
-                    destination_path.display()
-                )
-            }),
-        Err(err) => Err(err).with_context(|| {
-            format!(
-                "failed to move {} to {}",
-                source_path.display(),
-                destination_path.display()
-            )
-        }),
-    }
-}
-
-fn is_cross_device_link_error(err: &std::io::Error) -> bool {
-    err.raw_os_error() == Some(18)
-}
-
-fn move_with_mv(source_path: &Path, destination_path: &Path) -> Result<()> {
-    let output = StdCommand::new("mv")
+fn move_with_rsync(source_path: &Path, destination_path: &Path) -> Result<()> {
+    let output = StdCommand::new("rsync")
+        .arg("-avh")
+        .arg("--progress")
+        .arg("--remove-source-files")
         .arg("--")
         .arg(source_path)
         .arg(destination_path)
+        .stdout(Stdio::null())
         .output()
-        .context("failed to spawn mv")?;
+        .context("failed to spawn rsync")?;
 
     if output.status.success() {
         return Ok(());
@@ -467,10 +438,23 @@ fn move_with_mv(source_path: &Path, destination_path: &Path) -> Result<()> {
 
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
     if stderr.is_empty() {
-        bail!("mv exited with status {}", output.status);
+        bail!("rsync exited with status {}", output.status);
     }
 
-    bail!("mv exited with status {}: {stderr}", output.status);
+    bail!("rsync exited with status {}: {stderr}", output.status);
+}
+
+fn remove_residual_source_path(path: &Path) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+
+    if path.is_dir() {
+        fs::remove_dir_all(path)
+            .with_context(|| format!("failed to remove residual source directory {}", path.display()))?;
+    }
+
+    Ok(())
 }
 
 /// Download a file, resuming partial work and using parallel segments when the total size is known.
@@ -1060,9 +1044,8 @@ mod tests {
     use anyhow::bail;
     use super::{
         build_external_target, choose_available_path, contains_payload_file, extract_external_link,
-        move_classified_target, move_classified_target_with_operations, move_path_with_fallback,
-        resolve_magnet_payload, ActiveDownloadKey, ClassificationTarget, ExternalSource,
-        LibraryKind,
+        move_classified_target, move_classified_target_with_operations, resolve_magnet_payload,
+        ActiveDownloadKey, ClassificationTarget, ExternalSource, LibraryKind,
     };
     use crate::config::AppConfig;
     use std::ffi::OsStr;
@@ -1388,33 +1371,43 @@ mod tests {
     }
 
     #[test]
-    fn move_path_with_fallback_uses_mv_after_cross_device_rename_error() {
-        let base = unique_test_dir("move-fallback-success");
-        let source = base.join("downloads").join("movie.mkv");
-        let destination = base.join("movies").join("movie.mkv");
-        fs::create_dir_all(source.parent().unwrap()).expect("downloads dir should exist");
-        fs::create_dir_all(destination.parent().unwrap()).expect("movie dir should exist");
-        fs::write(&source, b"payload").expect("source should exist");
+    fn move_classified_target_uses_external_mover_for_successful_transfer() {
+        let base = unique_test_dir("move-rsync-success");
+        let config = test_config(&base);
+        fs::create_dir_all(&config.movie_dir).expect("movie dir should exist");
+        fs::create_dir_all(&config.tv_show_dir).expect("tv dir should exist");
+        fs::create_dir_all(&config.anime_dir).expect("anime dir should exist");
+        let container = base.join("downloads").join("torrents").join("abc");
+        fs::create_dir_all(&container).expect("container should exist");
+        let source = container.join("Show");
+        fs::create_dir_all(&source).expect("payload dir should exist");
+        fs::write(source.join("episode.mkv"), b"payload").expect("payload file should exist");
 
-        move_path_with_fallback(
-            &source,
-            &destination,
-            &|_, _| Err(std::io::Error::from_raw_os_error(18)),
+        let destination = move_classified_target_with_operations(
+            &config,
+            &ClassificationTarget {
+                source_path: source.clone(),
+                cleanup_dir: Some(container.clone()),
+            },
+            LibraryKind::Movie,
             &|source, destination| {
-                fs::rename(source, destination)?;
+                copy_dir(source, destination)?;
+                remove_source_files(source)?;
                 Ok(())
             },
         )
-        .expect("mv fallback should succeed");
+        .expect("rsync-style move should succeed");
 
-        assert!(destination.exists());
+        assert_eq!(destination, config.movie_dir.join("Show"));
+        assert!(destination.join("episode.mkv").exists());
         assert!(!source.exists());
+        assert!(!container.exists());
         let _ = fs::remove_dir_all(&base);
     }
 
     #[test]
-    fn move_classified_target_keeps_cleanup_dir_when_mv_fallback_fails() {
-        let base = unique_test_dir("move-fallback-failure");
+    fn move_classified_target_keeps_cleanup_dir_when_external_mover_fails() {
+        let base = unique_test_dir("move-rsync-failure");
         let config = test_config(&base);
         fs::create_dir_all(&config.movie_dir).expect("movie dir should exist");
         fs::create_dir_all(&config.tv_show_dir).expect("tv dir should exist");
@@ -1431,10 +1424,9 @@ mod tests {
                 cleanup_dir: Some(container.clone()),
             },
             LibraryKind::Movie,
-            &|_, _| Err(std::io::Error::from_raw_os_error(18)),
-            &|_, _| bail!("mv exited with status 1: permission denied"),
+            &|_, _| bail!("rsync exited with status 23: permission denied"),
         )
-        .expect_err("mv fallback should fail");
+        .expect_err("external mover should fail");
 
         let rendered = format!("{error:#}");
         assert!(rendered.contains("failed to move"));
@@ -1469,5 +1461,38 @@ mod tests {
             aria2c_poll_interval_ms: 1000,
             reply_on_duplicate: true,
         }
+    }
+
+    fn copy_dir(source: &Path, destination: &Path) -> Result<(), std::io::Error> {
+        fs::create_dir_all(destination)?;
+        for entry in fs::read_dir(source)? {
+            let entry = entry?;
+            let entry_path = entry.path();
+            let destination_path = destination.join(entry.file_name());
+            if entry.file_type()?.is_dir() {
+                copy_dir(&entry_path, &destination_path)?;
+            } else {
+                fs::copy(&entry_path, &destination_path)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn remove_source_files(path: &Path) -> Result<(), std::io::Error> {
+        if !path.is_dir() {
+            return Ok(());
+        }
+
+        for entry in fs::read_dir(path)? {
+            let entry = entry?;
+            let entry_path = entry.path();
+            if entry.file_type()?.is_dir() {
+                remove_source_files(&entry_path)?;
+            } else {
+                fs::remove_file(&entry_path)?;
+            }
+        }
+
+        Ok(())
     }
 }

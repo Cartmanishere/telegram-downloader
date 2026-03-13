@@ -18,6 +18,7 @@ Rust Telegram media downloader built on `grammers-client`.
 - A Telegram API ID and API hash
 - A Telegram bot token
 - `aria2c` available on `PATH`, or configured via `ARIA2C_PATH`
+- `rsync` available on `PATH` for classified post-download moves
 
 ## Configuration
 
@@ -111,6 +112,7 @@ GitHub releases build and attach binaries for:
 - Direct-link downloads are written into `DOWNLOAD_DIR` using the URL filename when possible, or `download_<message_id>` as a fallback.
 - Magnet downloads are stored under `DOWNLOAD_DIR/torrents/<info_hash>/`.
 - After a successful download, the bot sends a Telegram prompt with `TV Show`, `Movie`, and `Anime` buttons. The original sender can also reply to that prompt with `TV Show`, `Movie`, or `Anime` as plain text.
+- Classified moves are delegated to `rsync -avh --progress --remove-source-files`, and the bot replies in Telegram after the move completes or fails.
 - When a magnet finishes, the bot classifies and moves the single top-level payload inside `DOWNLOAD_DIR/torrents/<info_hash>/`. If that directory is empty or contains multiple top-level payload entries, the bot reports that classification cannot proceed automatically.
 - The bot sends Telegram messages when a classified move starts and when it finishes or fails.
 - Telegram `text_link` formatting entities are not parsed in this version; only raw pasted links in message text/captions are recognized.
