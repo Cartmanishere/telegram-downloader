@@ -1,7 +1,8 @@
 use crate::config::AppConfig;
 use crate::download::{
     classify_download_request, download_external_with_aria2, download_with_resume,
-    move_classified_target, ActiveDownloadKey, ClassificationTarget, DownloadRequest, LibraryKind,
+    is_download_cancelled, move_classified_target, ActiveDownloadKey, ClassificationTarget,
+    DownloadCancellation, DownloadRequest, LibraryKind,
 };
 use crate::progress::{clear_terminal_line, ProgressTracker};
 use anyhow::{anyhow, Context, Result};
@@ -29,8 +30,17 @@ struct AppState {
     client: Client,
     semaphore: Arc<Semaphore>,
     active_downloads: Arc<Mutex<HashSet<ActiveDownloadKey>>>,
+    active_download_controls: Arc<Mutex<HashMap<u64, ActiveDownloadControl>>>,
     pending_classifications: Arc<Mutex<HashMap<u64, PendingClassification>>>,
+    next_download_id: AtomicU64,
     next_classification_id: AtomicU64,
+}
+
+#[derive(Clone)]
+struct ActiveDownloadControl {
+    original_sender_id: PeerId,
+    display_name: String,
+    cancellation: DownloadCancellation,
 }
 
 #[derive(Clone)]
@@ -47,6 +57,11 @@ enum ClassificationChoice {
     Movie,
     TvShow,
     Anime,
+}
+
+enum CallbackAction {
+    CancelDownload(u64),
+    Classification(u64, ClassificationChoice),
 }
 
 impl ClassificationChoice {
@@ -150,7 +165,9 @@ pub async fn run_app(config: AppConfig) -> Result<()> {
     let state = Arc::new(AppState {
         semaphore: Arc::new(Semaphore::new(config.max_concurrent_downloads)),
         active_downloads: Arc::new(Mutex::new(HashSet::new())),
+        active_download_controls: Arc::new(Mutex::new(HashMap::new())),
         pending_classifications: Arc::new(Mutex::new(HashMap::new())),
+        next_download_id: AtomicU64::new(1),
         next_classification_id: AtomicU64::new(1),
         config,
         client: client.clone(),
@@ -241,13 +258,31 @@ async fn process_message(state: Arc<AppState>, message: UpdateMessage) -> Result
     let filename = request.display_name();
     let tracker = ProgressTracker::new(filename.clone(), expected_size);
     let request_for_classification = request.clone();
+    let cancellation = DownloadCancellation::default();
+    let download_id = state.next_download_id.fetch_add(1, Ordering::Relaxed);
+    let original_sender_id = message.sender().map(|sender| sender.id());
     let progress_message = message
-        .reply(code_message("⬇️ Starting download: ", &filename, ""))
+        .reply(progress_status_message(
+            &format!("⬇️ Starting download: {filename}"),
+            Some(download_id),
+        ))
         .await
         .ok();
+    if let Some(original_sender_id) = original_sender_id {
+        state.active_download_controls.lock().await.insert(
+            download_id,
+            ActiveDownloadControl {
+                original_sender_id,
+                display_name: filename.clone(),
+                cancellation: cancellation.clone(),
+            },
+        );
+    }
     let updater_handle = tokio::spawn(progress_message_updater(
         progress_message.clone(),
         tracker.clone(),
+        download_id,
+        cancellation.clone(),
     ));
 
     let result = execute_download_request(
@@ -255,12 +290,18 @@ async fn process_message(state: Arc<AppState>, message: UpdateMessage) -> Result
         state.config.clone(),
         request,
         tracker.clone(),
+        cancellation.clone(),
     )
     .await;
 
     drop(permit);
     clear_terminal_line().await?;
     updater_handle.abort();
+    state
+        .active_download_controls
+        .lock()
+        .await
+        .remove(&download_id);
 
     match result {
         Ok(()) => {
@@ -342,23 +383,35 @@ async fn process_message(state: Arc<AppState>, message: UpdateMessage) -> Result
             }
         }
         Err(err) => {
-            error!("Download failed for {}: {err:#}", filename);
-            if let Some(progress_message) = progress_message.clone() {
-                let _ = progress_message
-                    .edit(code_message(
+            if is_download_cancelled(&err) {
+                info!("Download cancelled for {}", filename);
+                if let Some(progress_message) = progress_message.clone() {
+                    let _ = progress_message
+                        .edit(code_message("🛑 Download cancelled: ", &filename, ""))
+                        .await;
+                }
+                let _ = message
+                    .reply(code_message("🛑 Download cancelled: ", &filename, ""))
+                    .await;
+            } else {
+                error!("Download failed for {}: {err:#}", filename);
+                if let Some(progress_message) = progress_message.clone() {
+                    let _ = progress_message
+                        .edit(code_message(
+                            "❌ Download failed for ",
+                            &filename,
+                            &format!(": {err}"),
+                        ))
+                        .await;
+                }
+                let _ = message
+                    .reply(code_message(
                         "❌ Download failed for ",
                         &filename,
                         &format!(": {err}"),
                     ))
                     .await;
             }
-            let _ = message
-                .reply(code_message(
-                    "❌ Download failed for ",
-                    &filename,
-                    &format!(": {err}"),
-                ))
-                .await;
         }
     }
 
@@ -435,14 +488,68 @@ async fn try_handle_text_classification_reply(
 }
 
 async fn process_callback_query(state: Arc<AppState>, query: CallbackQuery) -> Result<()> {
-    let Some((job_id, choice)) = ClassificationChoice::from_callback_data(query.data()) else {
+    let Some(action) = callback_action_from_data(query.data()) else {
         query.answer().text("Unknown action.").send().await?;
         return Ok(());
     };
-    let sender_id = query.sender().id();
-    let response = complete_classification_job(&state, job_id, choice, sender_id, None).await?;
-    query.answer().text(response).send().await?;
+    match action {
+        CallbackAction::CancelDownload(download_id) => {
+            let response =
+                request_download_cancellation(&state, download_id, query.sender().id()).await?;
+            if response.toast == "🛑 Cancellation requested." {
+                let _ = query
+                    .answer()
+                    .text(response.toast)
+                    .edit(progress_status_message(
+                        &format!("🛑 Cancelling download: {}", response.display_name),
+                        Some(download_id),
+                    ))
+                    .await;
+            } else {
+                query.answer().text(response.toast).send().await?;
+            }
+        }
+        CallbackAction::Classification(job_id, choice) => {
+            let sender_id = query.sender().id();
+            let response =
+                complete_classification_job(&state, job_id, choice, sender_id, None).await?;
+            query.answer().text(response).send().await?;
+        }
+    }
     Ok(())
+}
+
+struct CancelRequestResponse {
+    toast: &'static str,
+    display_name: String,
+}
+
+async fn request_download_cancellation(
+    state: &Arc<AppState>,
+    download_id: u64,
+    sender_id: PeerId,
+) -> Result<CancelRequestResponse> {
+    let control = {
+        let active = state.active_download_controls.lock().await;
+        active.get(&download_id).cloned()
+    };
+    let Some(control) = control else {
+        return Ok(CancelRequestResponse {
+            toast: "⌛ That download is no longer active.",
+            display_name: "download".to_string(),
+        });
+    };
+    if control.original_sender_id != sender_id {
+        return Ok(CancelRequestResponse {
+            toast: "🔒 Only the original sender can cancel this download.",
+            display_name: control.display_name,
+        });
+    }
+    control.cancellation.cancel();
+    Ok(CancelRequestResponse {
+        toast: "🛑 Cancellation requested.",
+        display_name: control.display_name,
+    })
 }
 
 async fn complete_classification_job(
@@ -543,6 +650,7 @@ async fn execute_download_request(
     config: AppConfig,
     request: DownloadRequest,
     tracker: ProgressTracker,
+    cancellation: DownloadCancellation,
 ) -> Result<()> {
     match request {
         DownloadRequest::TelegramMedia {
@@ -557,6 +665,7 @@ async fn execute_download_request(
                 &target_path,
                 candidate.file_size,
                 tracker,
+                cancellation,
             )
             .await
         }
@@ -564,11 +673,18 @@ async fn execute_download_request(
             source,
             target_path,
             ..
-        } => download_external_with_aria2(config, source, &target_path, tracker).await,
+        } => {
+            download_external_with_aria2(config, source, &target_path, tracker, cancellation).await
+        }
     }
 }
 
-async fn progress_message_updater(progress_message: Option<Message>, tracker: ProgressTracker) {
+async fn progress_message_updater(
+    progress_message: Option<Message>,
+    tracker: ProgressTracker,
+    download_id: u64,
+    cancellation: DownloadCancellation,
+) {
     let Some(progress_message) = progress_message else {
         return;
     };
@@ -576,6 +692,9 @@ async fn progress_message_updater(progress_message: Option<Message>, tracker: Pr
     let mut last_sent_text = String::new();
     loop {
         tokio::time::sleep(Duration::from_secs(PROGRESS_EDIT_INTERVAL_SECONDS)).await;
+        if cancellation.is_cancelled() {
+            return;
+        }
         let current_text = format!(
             "⏳ Download in progress: {}",
             tracker.current_status_text().await
@@ -583,9 +702,35 @@ async fn progress_message_updater(progress_message: Option<Message>, tracker: Pr
         if current_text == last_sent_text {
             continue;
         }
-        if progress_message.edit(current_text.clone()).await.is_err() {
+        if progress_message
+            .edit(progress_status_message(&current_text, Some(download_id)))
+            .await
+            .is_err()
+        {
             return;
         }
         last_sent_text = current_text;
+    }
+}
+
+fn callback_action_from_data(data: &[u8]) -> Option<CallbackAction> {
+    let raw = std::str::from_utf8(data).ok()?;
+    if let Some(id) = raw.strip_prefix("cancel:") {
+        return Some(CallbackAction::CancelDownload(id.parse().ok()?));
+    }
+    let (job_id, choice) = ClassificationChoice::from_callback_data(data)?;
+    Some(CallbackAction::Classification(job_id, choice))
+}
+
+fn progress_status_message(text: &str, download_id: Option<u64>) -> InputMessage {
+    let message = InputMessage::new().text(text.to_string());
+    match download_id {
+        Some(download_id) => {
+            message.reply_markup(&reply_markup::inline(vec![vec![button::inline(
+                "Cancel",
+                format!("cancel:{download_id}").into_bytes(),
+            )]]))
+        }
+        None => message,
     }
 }

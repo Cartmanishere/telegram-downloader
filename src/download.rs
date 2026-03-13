@@ -10,15 +10,19 @@ use reqwest::{Client as HttpClient, Url};
 use serde::Deserialize;
 use serde_json::json;
 use std::ffi::OsStr;
+use std::fmt;
 use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Command as StdCommand, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::fs::{self as tokio_fs, File, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::process::Command as TokioCommand;
+use tokio::sync::Notify;
 
 /// Identifies a download already in progress so duplicate updates can be ignored.
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
@@ -66,6 +70,45 @@ pub enum DownloadRequest {
         target_path: PathBuf,
         expected_size: Option<u64>,
     },
+}
+
+#[derive(Clone, Default)]
+pub struct DownloadCancellation {
+    cancelled: Arc<AtomicBool>,
+    notify: Arc<Notify>,
+}
+
+impl DownloadCancellation {
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::SeqCst);
+        self.notify.notify_waiters();
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::SeqCst)
+    }
+
+    pub async fn cancelled(&self) {
+        if self.is_cancelled() {
+            return;
+        }
+        self.notify.notified().await;
+    }
+}
+
+#[derive(Debug)]
+pub struct DownloadCancelled;
+
+impl fmt::Display for DownloadCancelled {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "download cancelled")
+    }
+}
+
+impl std::error::Error for DownloadCancelled {}
+
+pub fn is_download_cancelled(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<DownloadCancelled>().is_some()
 }
 
 #[derive(Clone)]
@@ -450,8 +493,12 @@ fn remove_residual_source_path(path: &Path) -> Result<()> {
     }
 
     if path.is_dir() {
-        fs::remove_dir_all(path)
-            .with_context(|| format!("failed to remove residual source directory {}", path.display()))?;
+        fs::remove_dir_all(path).with_context(|| {
+            format!(
+                "failed to remove residual source directory {}",
+                path.display()
+            )
+        })?;
     }
 
     Ok(())
@@ -465,17 +512,23 @@ pub async fn download_with_resume(
     target_path: &Path,
     expected_size: Option<u64>,
     tracker: ProgressTracker,
+    cancellation: DownloadCancellation,
 ) -> Result<()> {
     let Some(total_size) = expected_size.filter(|size| *size > 0) else {
-        return download_single_stream(
+        let result = download_single_stream(
             client,
             config.chunk_size,
             media,
             target_path,
             expected_size,
             tracker,
+            cancellation.clone(),
         )
         .await;
+        if cancellation.is_cancelled() {
+            cleanup_single_stream_partial(target_path).await?;
+        }
+        return result;
     };
 
     let work_dir = partial_work_dir(&config.download_dir, target_path);
@@ -501,16 +554,40 @@ pub async fn download_with_resume(
         let client = client.clone();
         let media = media.clone();
         let chunk_size = config.chunk_size;
+        let cancellation = cancellation.clone();
         handles.push(tokio::spawn(async move {
-            download_segment(client, media, plan, chunk_size, tracker).await
+            download_segment(client, media, plan, chunk_size, tracker, cancellation).await
         }));
     }
 
-    for handle in handles {
-        handle.await??;
+    let result = join_all(handles).await;
+    let mut first_err = None;
+    for handle in result {
+        match handle {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                cancellation.cancel();
+                if first_err.is_none() {
+                    first_err = Some(err);
+                }
+            }
+            Err(err) => {
+                cancellation.cancel();
+                if first_err.is_none() {
+                    first_err = Some(err.into());
+                }
+            }
+        }
+    }
+    if let Some(err) = first_err {
+        let _ = tokio_fs::remove_dir_all(&work_dir).await;
+        let _ = tokio_fs::remove_file(target_path).await;
+        let assembling_path = assembling_target_path(target_path);
+        let _ = tokio_fs::remove_file(assembling_path).await;
+        return Err(err);
     }
 
-    merge_segments(&plans, target_path).await?;
+    merge_segments(&plans, target_path, &cancellation).await?;
     let _ = tokio_fs::remove_dir_all(&work_dir).await;
     Ok(())
 }
@@ -520,6 +597,7 @@ pub async fn download_external_with_aria2(
     source: ExternalSource,
     target_path: &Path,
     tracker: ProgressTracker,
+    cancellation: DownloadCancellation,
 ) -> Result<()> {
     let (rpc_url, rpc_secret, rpc_port) = allocate_rpc_endpoint(&config).await?;
     let mut command = TokioCommand::new(&config.aria2c_path);
@@ -577,10 +655,15 @@ pub async fn download_external_with_aria2(
     let http = HttpClient::builder().build()?;
     let poll_interval = Duration::from_millis(config.aria2c_poll_interval_ms);
     let mut shutdown_requested = false;
+    let mut cancelled = false;
 
     let exit_status = loop {
         tokio::select! {
             status = child.wait() => break status?,
+            _ = cancellation.cancelled(), if !cancelled => {
+                cancelled = true;
+                let _ = child.start_kill();
+            }
             _ = tokio::time::sleep(poll_interval) => {
                 if let Ok(snapshot) = refresh_tracker_from_aria2(&http, &rpc_url, &rpc_secret, &tracker).await {
                     if snapshot.is_terminal() && !shutdown_requested {
@@ -601,6 +684,10 @@ pub async fn download_external_with_aria2(
 
     let _ = refresh_tracker_from_aria2(&http, &rpc_url, &rpc_secret, &tracker).await;
     let stderr_text = stderr_task.await??;
+    if cancelled {
+        cleanup_external_partial(&source, target_path).await?;
+        return Err(anyhow::Error::new(DownloadCancelled));
+    }
     if !exit_status.success() {
         if stderr_text.is_empty() {
             bail!("aria2c exited with status {exit_status}");
@@ -637,6 +724,7 @@ async fn download_single_stream(
     target_path: &Path,
     expected_size: Option<u64>,
     tracker: ProgressTracker,
+    cancellation: DownloadCancellation,
 ) -> Result<()> {
     let partial_path = partial_file_path(target_path);
     if let Some(parent) = partial_path.parent() {
@@ -655,12 +743,25 @@ async fn download_single_stream(
 
     let mut downloaded = existing_size;
     let mut stream = build_download_stream(&client, &media, chunk_size, existing_size);
-    while let Some(chunk) = stream.next().await? {
+    loop {
+        if cancellation.is_cancelled() {
+            return Err(anyhow::Error::new(DownloadCancelled));
+        }
+        let chunk = tokio::select! {
+            _ = cancellation.cancelled() => return Err(anyhow::Error::new(DownloadCancelled)),
+            chunk = stream.next() => chunk?,
+        };
+        let Some(chunk) = chunk else {
+            break;
+        };
         file.write_all(&chunk).await?;
         downloaded += chunk.len() as u64;
         tracker.update(0, downloaded).await?;
     }
     file.flush().await?;
+    if cancellation.is_cancelled() {
+        return Err(anyhow::Error::new(DownloadCancelled));
+    }
 
     if let Some(expected_size) = expected_size {
         let actual = fs::metadata(&partial_path)?.len();
@@ -681,6 +782,7 @@ async fn download_segment(
     plan: SegmentPlan,
     chunk_size: usize,
     tracker: ProgressTracker,
+    cancellation: DownloadCancellation,
 ) -> Result<()> {
     if let Some(parent) = plan.part_path.parent() {
         tokio_fs::create_dir_all(parent).await?;
@@ -706,7 +808,17 @@ async fn download_segment(
     tracker.update(plan.index, downloaded).await?;
 
     let mut stream = build_download_stream(&client, &media, chunk_size, offset);
-    while let Some(chunk) = stream.next().await? {
+    while remaining > 0 {
+        if cancellation.is_cancelled() {
+            return Err(anyhow::Error::new(DownloadCancelled));
+        }
+        let chunk = tokio::select! {
+            _ = cancellation.cancelled() => return Err(anyhow::Error::new(DownloadCancelled)),
+            chunk = stream.next() => chunk?,
+        };
+        let Some(chunk) = chunk else {
+            break;
+        };
         if remaining == 0 {
             break;
         }
@@ -737,21 +849,63 @@ async fn download_segment(
     Ok(())
 }
 
-async fn merge_segments(plans: &[SegmentPlan], target_path: &Path) -> Result<()> {
-    let temp_target = target_path.with_file_name(format!(
+async fn merge_segments(
+    plans: &[SegmentPlan],
+    target_path: &Path,
+    cancellation: &DownloadCancellation,
+) -> Result<()> {
+    let temp_target = assembling_target_path(target_path);
+    let mut out = File::create(&temp_target).await?;
+    for plan in plans {
+        if cancellation.is_cancelled() {
+            let _ = tokio_fs::remove_file(&temp_target).await;
+            return Err(anyhow::Error::new(DownloadCancelled));
+        }
+        let bytes = tokio_fs::read(&plan.part_path).await?;
+        out.write_all(&bytes).await?;
+    }
+    out.flush().await?;
+    if cancellation.is_cancelled() {
+        let _ = tokio_fs::remove_file(&temp_target).await;
+        return Err(anyhow::Error::new(DownloadCancelled));
+    }
+    tokio_fs::rename(temp_target, target_path).await?;
+    Ok(())
+}
+
+fn assembling_target_path(target_path: &Path) -> PathBuf {
+    target_path.with_file_name(format!(
         "{}.assembling",
         target_path
             .file_name()
             .map(|value| value.to_string_lossy())
             .unwrap_or_default()
-    ));
-    let mut out = File::create(&temp_target).await?;
-    for plan in plans {
-        let bytes = tokio_fs::read(&plan.part_path).await?;
-        out.write_all(&bytes).await?;
+    ))
+}
+
+async fn cleanup_single_stream_partial(target_path: &Path) -> Result<()> {
+    let partial_path = partial_file_path(target_path);
+    let _ = tokio_fs::remove_file(partial_path).await;
+    Ok(())
+}
+
+async fn cleanup_external_partial(source: &ExternalSource, target_path: &Path) -> Result<()> {
+    match source {
+        ExternalSource::DirectUrl { .. } => {
+            let _ = tokio_fs::remove_file(target_path).await;
+            let control_file = target_path.with_file_name(format!(
+                "{}.aria2",
+                target_path
+                    .file_name()
+                    .map(|value| value.to_string_lossy())
+                    .unwrap_or_default()
+            ));
+            let _ = tokio_fs::remove_file(control_file).await;
+        }
+        ExternalSource::Magnet { .. } => {
+            let _ = tokio_fs::remove_dir_all(target_path).await;
+        }
     }
-    out.flush().await?;
-    tokio_fs::rename(temp_target, target_path).await?;
     Ok(())
 }
 
@@ -1041,13 +1195,13 @@ async fn rpc_call<T: for<'de> Deserialize<'de>>(
 
 #[cfg(test)]
 mod tests {
-    use anyhow::bail;
     use super::{
         build_external_target, choose_available_path, contains_payload_file, extract_external_link,
         move_classified_target, move_classified_target_with_operations, resolve_magnet_payload,
         ActiveDownloadKey, ClassificationTarget, ExternalSource, LibraryKind,
     };
     use crate::config::AppConfig;
+    use anyhow::bail;
     use std::ffi::OsStr;
     use std::fs;
     use std::path::{Path, PathBuf};
