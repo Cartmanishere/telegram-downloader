@@ -11,10 +11,11 @@ use grammers_client::types::update::CallbackQuery;
 use grammers_client::types::update::Message as UpdateMessage;
 use grammers_client::types::Message;
 use grammers_client::{button, reply_markup, Client, InputMessage, Update, UpdatesConfiguration};
+use grammers_mtsender::InvocationError;
 use grammers_mtsender::SenderPool;
 use grammers_session::defs::PeerId;
 use grammers_session::storages::SqliteSession;
-use log::{error, info};
+use log::{error, info, warn};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -23,6 +24,7 @@ use std::time::Duration;
 use tokio::sync::{Mutex, Semaphore};
 
 const PROGRESS_EDIT_INTERVAL_SECONDS: u64 = 10;
+const UPDATE_STREAM_RETRY_DELAY_SECONDS: u64 = 3;
 
 /// Shared runtime state used by every spawned message handler.
 struct AppState {
@@ -174,7 +176,14 @@ pub async fn run_app(config: AppConfig) -> Result<()> {
     });
 
     loop {
-        let update = update_stream.next().await?;
+        let update = match update_stream.next().await {
+            Ok(update) => update,
+            Err(err) => {
+                error!("update stream failed, retrying in {UPDATE_STREAM_RETRY_DELAY_SECONDS}s: {err:#}");
+                tokio::time::sleep(Duration::from_secs(UPDATE_STREAM_RETRY_DELAY_SECONDS)).await;
+                continue;
+            }
+        };
         match update {
             Update::NewMessage(message) => {
                 if message.outgoing() {
@@ -495,7 +504,7 @@ async fn try_handle_text_classification_reply(
 
 async fn process_callback_query(state: Arc<AppState>, query: CallbackQuery) -> Result<()> {
     let Some(action) = callback_action_from_data(query.data()) else {
-        query.answer().text("Unknown action.").send().await?;
+        handle_callback_answer_result(query.answer().text("Unknown action.").send().await)?;
         return Ok(());
     };
     match action {
@@ -503,26 +512,36 @@ async fn process_callback_query(state: Arc<AppState>, query: CallbackQuery) -> R
             let response =
                 request_download_cancellation(&state, download_id, query.sender().id()).await?;
             if response.toast == "🛑 Cancellation requested." {
-                let _ = query
-                    .answer()
-                    .text(response.toast)
-                    .edit(progress_status_message(
+                handle_callback_answer_result(
+                    query.answer().text(response.toast).edit(progress_status_message(
                         &format!("🛑 Cancelling download: {}", response.display_name),
                         Some(download_id),
                     ))
-                    .await;
+                    .await,
+                )
+                ?;
             } else {
-                query.answer().text(response.toast).send().await?;
+                handle_callback_answer_result(query.answer().text(response.toast).send().await)?;
             }
         }
         CallbackAction::Classification(job_id, choice) => {
             let sender_id = query.sender().id();
-            let response =
-                complete_classification_job(&state, job_id, choice, sender_id, None).await?;
-            query.answer().text(response).send().await?;
+            handle_callback_answer_result(query.answer().text("🚚 Starting move...").send().await)?;
+            complete_classification_job(&state, job_id, choice, sender_id, None).await?;
         }
     }
     Ok(())
+}
+
+fn handle_callback_answer_result(result: std::result::Result<(), InvocationError>) -> Result<()> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(err) if is_stale_callback_answer_error(&err) => {
+            warn!("ignoring stale callback answer: {err:#}");
+            Ok(())
+        }
+        Err(err) => Err(err.into()),
+    }
 }
 
 struct CancelRequestResponse {
@@ -600,7 +619,13 @@ async fn complete_classification_job(
     );
     send_classification_status(state, &pending, starting_message).await;
 
-    match move_classified_target(&state.config, &pending.target, choice.to_library_kind()) {
+    let config = state.config.clone();
+    let target = pending.target.clone();
+    let library_kind = choice.to_library_kind();
+    match tokio::task::spawn_blocking(move || {
+        move_classified_target(&config, &target, library_kind)
+    })
+    .await? {
         Ok(destination_path) => {
             state.pending_classifications.lock().await.remove(&job_id);
             info!(
@@ -630,6 +655,10 @@ async fn complete_classification_job(
             Ok("❌ Move failed.")
         }
     }
+}
+
+fn is_stale_callback_answer_error(err: &InvocationError) -> bool {
+    matches!(err, InvocationError::Rpc(rpc_error) if rpc_error.code == 400 && rpc_error.name == "QUERY_ID_INVALID")
 }
 
 async fn send_classification_status(
@@ -737,5 +766,35 @@ fn progress_status_message(text: &str, download_id: Option<u64>) -> InputMessage
             )]]))
         }
         None => message,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_stale_callback_answer_error;
+    use grammers_mtsender::{InvocationError, RpcError};
+
+    #[test]
+    fn identifies_query_id_invalid_callback_errors() {
+        let err = InvocationError::Rpc(RpcError {
+            code: 400,
+            name: "QUERY_ID_INVALID".into(),
+            value: None,
+            caused_by: None,
+        });
+
+        assert!(is_stale_callback_answer_error(&err));
+    }
+
+    #[test]
+    fn ignores_other_rpc_errors() {
+        let err = InvocationError::Rpc(RpcError {
+            code: 400,
+            name: "MESSAGE_NOT_MODIFIED".into(),
+            value: None,
+            caused_by: None,
+        });
+
+        assert!(!is_stale_callback_answer_error(&err));
     }
 }
