@@ -1782,7 +1782,7 @@ dependencies = [
 
 [[package]]
 name = "telegram-downloader-rust"
-version = "0.0.9"
+version = "0.0.10"
 dependencies = [
  "anyhow",
  "dotenvy",
