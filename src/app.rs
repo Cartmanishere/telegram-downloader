@@ -6,6 +6,7 @@ use crate::download::{
 };
 use crate::progress::{clear_terminal_line, ProgressTracker};
 use anyhow::{anyhow, Context, Result};
+use grammers_client::client::updates::UpdatesLike;
 use grammers_client::grammers_tl_types as tl;
 use grammers_client::types::update::CallbackQuery;
 use grammers_client::types::update::Message as UpdateMessage;
@@ -21,7 +22,7 @@ use std::fs;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::{mpsc::UnboundedReceiver, Mutex, Semaphore};
 
 const PROGRESS_EDIT_INTERVAL_SECONDS: u64 = 10;
 const UPDATE_STREAM_RETRY_DELAY_SECONDS: u64 = 3;
@@ -29,7 +30,7 @@ const UPDATE_STREAM_RETRY_DELAY_SECONDS: u64 = 3;
 /// Shared runtime state used by every spawned message handler.
 struct AppState {
     config: AppConfig,
-    client: Client,
+    client: Arc<Mutex<Client>>,
     semaphore: Arc<Semaphore>,
     active_downloads: Arc<Mutex<HashSet<ActiveDownloadKey>>>,
     active_download_controls: Arc<Mutex<HashMap<u64, ActiveDownloadControl>>>,
@@ -133,28 +134,6 @@ pub async fn run_app(config: AppConfig) -> Result<()> {
         Arc::new(SqliteSession::open(&config.session_path).with_context(|| {
             format!("failed to open session {}", config.session_path.display())
         })?);
-    let pool = SenderPool::new(Arc::clone(&session), config.api_id);
-    let client = Client::new(&pool);
-    let SenderPool {
-        runner, updates, ..
-    } = pool;
-    let _runner_handle = tokio::spawn(runner.run());
-
-    authorize_client(&client, &config).await?;
-    let mut update_stream = client.stream_updates(
-        updates,
-        UpdatesConfiguration {
-            catch_up: false,
-            ..Default::default()
-        },
-    );
-
-    let me = client.get_me().await?;
-    let login_label = me
-        .username()
-        .map(str::to_owned)
-        .unwrap_or_else(|| me.raw.id().to_string());
-    info!("Logged in as {}", login_label);
     info!(
         "Download settings: workers={} segment_workers={} chunk_size={:.2} MB aria2_poll={}ms",
         config.max_concurrent_downloads,
@@ -164,6 +143,10 @@ pub async fn run_app(config: AppConfig) -> Result<()> {
     );
     info!("Listening for incoming Telegram messages with media or supported links");
 
+    let (client, login_label, updates, runner_handle) =
+        connect_telegram(Arc::clone(&session), &config).await?;
+    info!("Logged in as {}", login_label);
+
     let state = Arc::new(AppState {
         semaphore: Arc::new(Semaphore::new(config.max_concurrent_downloads)),
         active_downloads: Arc::new(Mutex::new(HashSet::new())),
@@ -171,16 +154,40 @@ pub async fn run_app(config: AppConfig) -> Result<()> {
         pending_classifications: Arc::new(Mutex::new(HashMap::new())),
         next_download_id: AtomicU64::new(1),
         next_classification_id: AtomicU64::new(1),
-        config,
-        client: client.clone(),
+        config: config.clone(),
+        client: Arc::new(Mutex::new(client.clone())),
     });
+
+    let mut runner_handle = runner_handle;
+    let mut update_stream = client.stream_updates(
+        updates,
+        UpdatesConfiguration {
+            catch_up: false,
+            ..Default::default()
+        },
+    );
 
     loop {
         let update = match update_stream.next().await {
             Ok(update) => update,
             Err(err) => {
-                error!("update stream failed, retrying in {UPDATE_STREAM_RETRY_DELAY_SECONDS}s: {err:#}");
+                error!(
+                    "update stream failed, reconnecting in {UPDATE_STREAM_RETRY_DELAY_SECONDS}s: {err:#}"
+                );
+                runner_handle.abort();
                 tokio::time::sleep(Duration::from_secs(UPDATE_STREAM_RETRY_DELAY_SECONDS)).await;
+                let (client, login_label, updates, new_runner_handle) =
+                    reconnect_telegram(Arc::clone(&session), &config).await;
+                info!("Telegram connection restored as {}", login_label);
+                *state.client.lock().await = client.clone();
+                runner_handle = new_runner_handle;
+                update_stream = client.stream_updates(
+                    updates,
+                    UpdatesConfiguration {
+                        catch_up: false,
+                        ..Default::default()
+                    },
+                );
                 continue;
             }
         };
@@ -218,6 +225,54 @@ async fn authorize_client(client: &Client, config: &AppConfig) -> Result<()> {
             .context("bot sign-in failed")?;
     }
     Ok(())
+}
+
+async fn connect_telegram(
+    session: Arc<SqliteSession>,
+    config: &AppConfig,
+) -> Result<(
+    Client,
+    String,
+    UnboundedReceiver<UpdatesLike>,
+    tokio::task::JoinHandle<()>,
+)> {
+    let pool = SenderPool::new(session, config.api_id);
+    let client = Client::new(&pool);
+    let SenderPool {
+        runner, updates, ..
+    } = pool;
+    let runner_handle = tokio::spawn(runner.run());
+
+    authorize_client(&client, config).await?;
+    let me = client.get_me().await?;
+    let login_label = me
+        .username()
+        .map(str::to_owned)
+        .unwrap_or_else(|| me.raw.id().to_string());
+
+    Ok((client, login_label, updates, runner_handle))
+}
+
+async fn reconnect_telegram(
+    session: Arc<SqliteSession>,
+    config: &AppConfig,
+) -> (
+    Client,
+    String,
+    UnboundedReceiver<UpdatesLike>,
+    tokio::task::JoinHandle<()>,
+) {
+    loop {
+        match connect_telegram(Arc::clone(&session), config).await {
+            Ok(connection) => return connection,
+            Err(err) => {
+                error!(
+                    "telegram reconnect attempt failed, retrying in {UPDATE_STREAM_RETRY_DELAY_SECONDS}s: {err:#}"
+                );
+                tokio::time::sleep(Duration::from_secs(UPDATE_STREAM_RETRY_DELAY_SECONDS)).await;
+            }
+        }
+    }
 }
 
 async fn process_message(state: Arc<AppState>, message: UpdateMessage) -> Result<()> {
@@ -295,7 +350,7 @@ async fn process_message(state: Arc<AppState>, message: UpdateMessage) -> Result
     ));
 
     let result = execute_download_request(
-        state.client.clone(),
+        state.client.lock().await.clone(),
         state.config.clone(),
         request,
         tracker.clone(),
